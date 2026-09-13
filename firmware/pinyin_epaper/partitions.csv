@@ -1,0 +1,8 @@
+# ESP-IDF Partition Table —— 8MB flash 布局
+# 实机: ESP32-S3-PICO-1, 内置 8MB flash + 8MB PSRAM
+# Name,   Type, SubType, Offset,   Size,      Flags
+nvs,      data, nvs,     0x9000,   0x6000,
+phy_init, data, phy,     0xf000,   0x1000,
+factory,  app,  factory, 0x10000,  0x400000,
+# esp-sr 离线语音模型（WakeNet 唤醒词 + MultiNet 中文命令词）预留
+model,    data, spiffs,  0x410000, 0x3E0000,
