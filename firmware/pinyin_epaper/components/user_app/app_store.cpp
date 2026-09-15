@@ -185,6 +185,7 @@ void app_store_set_shown(int code)
 
 static char (*s_groups)[SCOPE_NAME_LEN] = NULL;
 static int   s_group_n = 0;
+static char  s_group_dir[64] = "";
 
 static int cmp_name(const void *a, const void *b) { return strcmp((const char *)a, (const char *)b); }
 
@@ -193,6 +194,7 @@ int app_groups_scan(const char *dir)
     if (!s_groups)
         s_groups = (char (*)[SCOPE_NAME_LEN])heap_caps_calloc(GROUPS_MAX, SCOPE_NAME_LEN, MALLOC_CAP_SPIRAM);
     s_group_n = 0;
+    strncpy(s_group_dir, dir, sizeof(s_group_dir) - 1);
     DIR *d = s_groups ? opendir(dir) : NULL;
     if (!d) { ESP_LOGW(TAG, "打不开清单目录 %s", dir); return 0; }
 
@@ -219,6 +221,32 @@ int app_groups_find(const char *name)
     for (int g = 0; g < s_group_n; g++)
         if (strcmp(s_groups[g], name) == 0) return g;
     return -1;
+}
+
+/* 调试用：查某个字 / 说法在第几组 —— 跳字命令只注册当前组，别的组的字说了不会有反应 */
+void app_groups_grep(const char *query)
+{
+    static char line[256];                 /* 在控制台任务里跑，栈小，放静态区 */
+    int hits = 0;
+    for (int g = 0; g < s_group_n; g++) {
+        char path[160];
+        snprintf(path, sizeof(path), "%s/%s", s_group_dir, s_groups[g]);
+        FILE *f = fopen(path, "r");
+        if (!f) continue;
+        int idx = 0;                       /* 与 scope_load 一样跳过注释和空行，对上 c N */
+        while (fgets(line, sizeof(line), f)) {
+            line[strcspn(line, "\r\n")] = '\0';
+            if (line[0] == '#' || line[0] == '\0') continue;
+            if (strstr(line, query)) {
+                for (char *t = line; *t; t++) if (*t == '\t') *t = ' ';
+                ESP_LOGI(TAG, "第 %d 组 %s  c %d: %s", g + 1, s_groups[g], idx, line);
+                hits++;
+            }
+            idx++;
+        }
+        fclose(f);
+    }
+    ESP_LOGI(TAG, "find \"%s\": %d 处%s", query, hits, s_group_n ? "" : "（没有学习清单）");
 }
 
 /* ---------- 清单解析 ---------- */
