@@ -33,11 +33,15 @@ async def tts(text: str, out_mp3: Path) -> bool:
             await asyncio.sleep(1.5 * (attempt + 1))
     return False
 
-def to_wav(mp3: Path, wav: Path) -> bool:
-    """转 16k/16bit/单声道 PCM。"""
+def to_wav(mp3: Path, wav: Path, af: str | None = None) -> bool:
+    """转 16k/16bit/单声道 PCM。
+    -fflags +bitexact: 不写 LIST 元数据块（否则 PCM 要到第 78 字节才开始），得到标准 44 字节头。
+    af: 可选的 ffmpeg 音频滤镜（gen_prompts.py 用来裁首尾静音）"""
     r = subprocess.run(
         ["ffmpeg", "-y", "-loglevel", "error", "-i", str(mp3),
-         "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", str(wav)],
+         *(["-af", af] if af else []),
+         "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
+         "-fflags", "+bitexact", str(wav)],
         capture_output=True)
     return r.returncode == 0 and wav.exists()
 

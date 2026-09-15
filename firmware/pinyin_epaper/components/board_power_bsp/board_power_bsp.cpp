@@ -7,7 +7,13 @@ board_power_bsp_t::board_power_bsp_t(uint8_t _epd_power_pin,uint8_t _audio_power
     epd_power_pin(_epd_power_pin),
     audio_power_pin(_audio_power_pin),
     vbat_power_pin(_vbat_power_pin) {
-    gpio_config_t gpio_conf = {};                                                            
+    /* 电池供电时 PWR 键只是临时接通电源，必须尽早把 VBAT 自锁脚拉高，
+     * 否则一松手就断电。构造函数在 C++ 静态初始化阶段执行，是最早的时机。
+     * 先写输出电平再使能输出，避免出现一个低电平毛刺。*/
+    gpio_hold_dis((gpio_num_t)vbat_power_pin);
+    gpio_set_level((gpio_num_t)vbat_power_pin, 1);
+
+    gpio_config_t gpio_conf = {};                                                          
         gpio_conf.intr_type = GPIO_INTR_DISABLE;                                             
         gpio_conf.mode = GPIO_MODE_OUTPUT;                                                   
         gpio_conf.pin_bit_mask = (0x1ULL << epd_power_pin) | (0x1ULL << audio_power_pin) | (0x1ULL << vbat_power_pin);
