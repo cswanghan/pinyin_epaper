@@ -8,6 +8,10 @@
   <SD>/pinyin/img/0000.bin     墨水屏图，10000 字节
   <SD>/pinyin/aud/0000_c.wav   字音
   <SD>/pinyin/aud/0000_w.wav   词组
+  <SD>/pinyin/scope/*.txt      学习清单（一组一个文件）
+  <SD>/pinyin/sys/*.wav        语音提示（gen_prompts.py 生成，缺了固件用蜂鸣音代替）
+  <SD>/pinyin/config.txt       设备配置（已存在则不覆盖，保留家长改过的值）
+  <SD>/pinyin/progress.txt     学习进度（固件写，只读查看）
 """
 import json, os, shutil, subprocess, sys
 from pathlib import Path
@@ -20,6 +24,22 @@ BASE = Path(__file__).parent
 SRC_IMG = BASE / "out/img"
 SRC_AUD = BASE / "out/aud"
 CHARS   = BASE / "out/chars.json"
+
+DEFAULT_CONFIG = """\
+# 小学生字学习机配置 —— 改完重启设备生效，# 后面是注释
+# 音量 0-100
+volume=80
+# 唤醒灵敏度: normal 正常 / high 更灵敏（离得远也能唤醒，但误唤醒会多）
+wake_sensitivity=normal
+# 命令词识别阈值 0-1，0 = 模型默认。常把别的话听成命令就调高（如 0.3），说了没反应就调低（如 0.1）
+mn_threshold=0
+# 唤醒后等命令的秒数（2-30）
+listen_seconds=6
+# 执行完一条命令后继续听的秒数，期间直接说下一条命令不用再唤醒；0 = 关闭（0-30）
+follow_up_seconds=6
+# 用电池时多少分钟没操作自动关机，0 = 不自动关机（插着电脑时不会自动关机）
+sleep_minutes=10
+"""
 
 def main():
     if len(sys.argv) < 2:
@@ -58,6 +78,20 @@ def main():
         for f in sorted(src_scope.glob("*.txt")):
             shutil.copy(f, dst / "scope" / f.name); n_scope += 1
     print(f"学习清单 {n_scope} 组")
+
+    # 语音提示（可选）
+    src_sys = BASE / "out/sys"
+    n_sys = 0
+    if src_sys.exists():
+        (dst / "sys").mkdir(exist_ok=True)
+        for f in sorted(src_sys.glob("*.wav")):
+            shutil.copy(f, dst / "sys" / f.name); n_sys += 1
+    print(f"语音提示 {n_sys} 条" + ("" if n_sys else "（没有 out/sys，先跑 gen_prompts.py；不跑也能用，固件用蜂鸣音代替）"))
+
+    cfg = dst / "config.txt"
+    if not cfg.exists():
+        cfg.write_text(DEFAULT_CONFIG, encoding="utf-8")
+        print("写入默认 config.txt")
 
     (dst / "index.txt").write_text(f"{len(recs)}\n", encoding="utf-8")
     shutil.copy(CHARS, dst / "chars.json")
