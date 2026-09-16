@@ -15,6 +15,7 @@
 
 #include "app_console.h"
 #include "app_sr.h"
+#include "app_store.h"
 
 #define TAG "CONSOLE"
 
@@ -26,7 +27,8 @@ static const struct { const char *name; int cmd; } k_cmds[] = {
     {"m", SR_CMD_MASTERED},   {"f", SR_CMD_FORGOT},     {"v", SR_CMD_REVIEW},
     {"gn", SR_CMD_GROUP_NEXT}, {"gp", SR_CMD_GROUP_PREV},
     {"wake", SR_EVT_WAKE},    {"timeout", SR_EVT_TIMEOUT},
-    {"s", APP_EVT_STATUS},    {"export", APP_EVT_EXPORT}, {"off", APP_EVT_POWER_OFF},
+    {"s", APP_EVT_STATUS},    {"l", APP_EVT_LIST},
+    {"export", APP_EVT_EXPORT}, {"off", APP_EVT_POWER_OFF},
 };
 
 static void run_line(char *s)
@@ -42,7 +44,13 @@ static void run_line(char *s)
     int n;
     if (sscanf(s, "g %d", &n) == 1 && n >= 1 && n <= SR_MAX_GROUPS) { s_post(SR_CMD_GROUP_BASE + n); return; }
     if (sscanf(s, "c %d", &n) == 1 && n >= 0 && n < SR_MAX_SCOPE_CHARS) { s_post(SR_CMD_CHAR_BASE + n); return; }
-    ESP_LOGI(TAG, "命令: n p r w m f v gn gp | g N 第N组 | c N 第N个字(从0起) | wake timeout s export off");
+    if (strncmp(s, "find ", 5) == 0) {
+        /* 只读 SD 上的清单文件，不碰学习状态，直接在本任务里做 */
+        const char *q = s + 5;
+        while (*q == ' ') q++;
+        if (*q) { app_groups_grep(q); return; }
+    }
+    ESP_LOGI(TAG, "命令: n p r w m f v gn gp | g N 第N组 | c N 第N个字(从0起) | l 本组字表 | find 汉字或拼音 | wake timeout s export off");
 }
 
 static void console_task(void *arg)
@@ -58,7 +66,7 @@ static void console_task(void *arg)
             len = 0;
         } else if (ch == 8 || ch == 127) {
             if (len) len--;
-        } else if (ch >= 0x20 && ch < 0x7f && len < sizeof(line) - 1) {
+        } else if (ch >= 0x20 && len < sizeof(line) - 1) {   /* 含 UTF-8，find 可以直接敲汉字 */
             line[len++] = (char)ch;
         }
     }
@@ -75,6 +83,6 @@ void app_console_start(console_post_t post)
         return;
     }
     usb_serial_jtag_vfs_use_driver();
-    xTaskCreate(console_task, "console", 3 * 1024, NULL, 2, NULL);
+    xTaskCreate(console_task, "console", 4 * 1024, NULL, 2, NULL);   /* find 要读 SD */
     ESP_LOGI(TAG, "调试控制台就绪：在 idf.py monitor 里敲命令回车，敲 ? 看帮助");
 }

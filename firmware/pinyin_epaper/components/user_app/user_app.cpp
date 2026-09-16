@@ -72,6 +72,7 @@ static bool     s_dirty      = false;   /* 进度有变化，还没导出 */
 static int64_t  s_dirty_at   = 0;
 static int64_t  s_active_at  = 0;       /* 最近一次操作，用于自动关机 */
 static int64_t  s_busy_said  = 0;
+static int64_t  s_show_at    = 0;       /* 换组后推迟到这个时刻再呈现，0 = 没有 */
 
 static QueueHandle_t  s_cmd_q     = NULL;
 static QueueHandle_t  s_disp_q    = NULL;
@@ -176,6 +177,7 @@ static void mark_dirty(void)
 /* 呈现当前字：记进度 → 读字音和词组 → 刷屏（三者并行）*/
 static void show(void)
 {
+    s_show_at = 0;
     int id = cur_id();
     if (id < 0) return;
     ESP_LOGI(TAG, "→ %s 第 %d/%d 个「%s」 id=%d%s", s_scope->name[0] ? s_scope->name : "全部字",
@@ -212,6 +214,9 @@ static void sr_update_scope(void)
         app_sr_set_scope(s_scope->phrases, s_scope->n, app_groups_count());
 }
 
+/* 换组后推迟呈现的时长：连续对话窗口 + 1 秒（窗口末尾说的话还要识别完）*/
+static int64_t defer_us(void) { return (int64_t)(s_cfg.follow_up_seconds + 1) * 1000 * 1000; }
+
 static void switch_group(int g)
 {
     int gc = app_groups_count();
@@ -234,7 +239,15 @@ static void switch_group(int g)
     if (first < 0) app_audio_prompt("all_done", TONE_DONE);
     sr_update_scope();
     mark_dirty();
-    show();
+
+    /* 先不呈现：换组后常常紧接着说要学的字（「如果的如」）。等一个连续对话窗口，
+     * 说了就直接刷到那个字，没说再呈现本组第一个字 —— 刷一次屏 21 秒，别白刷 */
+    if (s_sr_ready && s_cfg.follow_up_seconds > 0) {
+        s_show_at = esp_timer_get_time() + defer_us();
+        ESP_LOGI(TAG, "先不刷屏，提示音放完再等 %d 秒，看要不要跳字", s_cfg.follow_up_seconds + 1);
+    } else {
+        show();
+    }
 }
 
 static void log_status(void)
@@ -250,6 +263,17 @@ static void log_status(void)
              app_power_vbat_mv(), app_power_usb_connected(),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+}
+
+/* 列出本组的字和跳字说法 —— 跳字命令只注册了本组，别的组的字说了不会有反应 */
+static void log_scope(void)
+{
+    if (!s_scope->name[0]) { ESP_LOGI(TAG, "没有学习清单（全部字模式），没有跳字命令"); return; }
+    ESP_LOGI(TAG, "第 %d 组 %s 共 %d 字，跳字说法:", s_group + 1, s_scope->name, s_scope->n);
+    for (int i = 0; i < s_scope->n; i++)
+        ESP_LOGI(TAG, "  c %-3d %s%s  %s", i, s_scope->chars[i],
+                 app_store_is_mastered(s_scope->ids[i]) ? "✓" : " ",
+                 s_scope->phrases[i][0] ? s_scope->phrases[i] : "(无)");
 }
 
 static void power_off(const char *why)
@@ -281,6 +305,7 @@ static void handle_learn_cmd(int cmd)
     }
     int id = cur_id();
     if (id < 0) return;
+    if (s_show_at && cmd == SR_CMD_NEXT) { show(); return; }   /* 换组后还没呈现：下一个就是本组第一个字 */
 
     if (cmd >= SR_CMD_GROUP_BASE) {
         int g = cmd - SR_CMD_GROUP_BASE;               /* 从 1 开始 */
@@ -354,6 +379,7 @@ static void handle_cmd(int cmd)
         ESP_LOGI(TAG, "语音就绪 —— 说「你好小智」唤醒");
         return;
     case APP_EVT_STATUS:    log_status(); return;
+    case APP_EVT_LIST:      log_scope(); return;
     case APP_EVT_EXPORT:    export_progress(); return;
     case APP_EVT_POWER_OFF: power_off("长按 PWR"); return;
     case SR_EVT_WAKE:       app_audio_prompt("wake", TONE_WAKE); break;
@@ -368,9 +394,13 @@ static void command_task(void *arg)
     s_active_at = esp_timer_get_time();
     for (;;) {
         int cmd;
-        if (xQueueReceive(s_cmd_q, &cmd, pdMS_TO_TICKS(1000)) == pdTRUE) handle_cmd(cmd);
+        if (xQueueReceive(s_cmd_q, &cmd, pdMS_TO_TICKS(s_show_at ? 100 : 1000)) == pdTRUE) handle_cmd(cmd);
 
         int64_t now = esp_timer_get_time();
+        if (s_show_at) {                                  /* 换组后推迟的呈现：提示音放完才开始计时 */
+            if (!app_audio_idle()) s_show_at = now + defer_us();
+            else if (now >= s_show_at) show();
+        }
         bool idle = !s_disp_busy && app_audio_idle();
         if (s_dirty && idle && now - s_dirty_at > EXPORT_DELAY_US) export_progress();
 

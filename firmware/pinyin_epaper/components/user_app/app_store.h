@@ -55,6 +55,7 @@ int         app_groups_scan(const char *dir);   /* 列出 *.txt 并按文件名�
 int         app_groups_count(void);
 const char *app_groups_name(int g);
 int         app_groups_find(const char *name);  /* 找不到返回 -1 */
+void        app_groups_grep(const char *query); /* 在所有清单里找含 query 的行（汉字或拼音），打印组号 */
 
 scope_t *scope_new(int cap);
 void     scope_free(scope_t *s);

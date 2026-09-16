@@ -15,6 +15,10 @@
  *      detect 拿不到锁就丢弃这一帧，保证 AFE 的输出一直被取走、不会堵塞。
  *   3. 连续对话：命令执行后继续听 follow_up_ms，不用每次都喊唤醒词。
  *      播放期间暂停计时，读完字音后孩子仍有完整的时间说下一句。
+ *      窗口按送进 MultiNet 的录音时长计，不按墙钟（见 detect_task）。
+ *   4. WakeNet 和 MultiNet 都在 CPU1 的 detect 任务里跑，160 MHz 下一起跑算不过来
+ *      （任务看门狗报过 IDLE1 饿死）。所以 CPU 开到 240 MHz、数据缓存 64 KB
+ *      （sdkconfig，esp-sr 推荐配置），并且等命令期间关掉 WakeNet。
  *****************************************************************************/
 #include <stdio.h>
 #include <string.h>
@@ -48,6 +52,7 @@ static sr_config_t       s_cfg   = { false, 0.0f, 6000, 6000 };
 static SemaphoreHandle_t s_lock  = NULL;     /* 保护 MultiNet（detect / 重新注册）*/
 static volatile bool     s_muted = false;
 static int               s_phrase_n = 0;     /* 本轮已注册条数，用于截断 */
+static int               s_spms  = 16;       /* 每毫秒采样数 */
 
 void app_sr_set_muted(bool muted) { s_muted = muted; }
 
@@ -175,48 +180,114 @@ static void feed_task(void *arg)
 }
 
 /* ---------- detect 任务：唤醒 + 命令词 ----------
- * IDLE   只看唤醒词
- * LISTEN 送 MultiNet 识别，截止时间到了回 IDLE
+ * IDLE   只跑唤醒词
+ * LISTEN 关掉唤醒词，录音送 MultiNet 识别，窗口用完回 IDLE
  *        唤醒后没说任何命令就超时 → 回调 SR_EVT_TIMEOUT（提示音）
  *        连续对话窗口结束 → 静默回 IDLE
+ *
+ * 窗口按「送进 MultiNet 的录音时长」计，不看墙钟：算得慢时录音在 AFE 缓冲里排队，
+ * 按墙钟会把还没算到的话当成超时扔掉。同理，切组重新注册命令词时等锁，不丢帧。
+ * 播放期间 feed 任务喂的是全零，这样的帧不计时，放完重新给满一个窗口。按帧内容
+ * 而不是 s_muted 判断，因为排队处理到这一帧时标志可能早就变了。
  */
+
+/* 一个窗口的诊断数据，窗口结束打一行：没识别到时看是哪一环出了问题 */
+typedef struct {
+    int64_t t0;          /* 窗口开始（墙钟 us）*/
+    int     heard;       /* 送进 MultiNet 的采样数 */
+    int     muted;       /* 播放中屏蔽掉的采样数 */
+    int     speech;      /* 其中 VAD 判为人声的采样数 */
+    int     speech_at;   /* 第一次听到人声时已送了多少采样，-1 = 没听到 */
+    float   peak_db;     /* 送进去的录音的最大音量 */
+    float   min_free;    /* AFE 缓冲最少剩多少，越小说明排队越多 */
+    int64_t wait_us;     /* 等重新注册命令词 */
+    int64_t det_us;      /* detect() 总耗时 */
+    int     det_max_us;
+} win_stat_t;
+
+static void win_reset(win_stat_t *w)
+{
+    memset(w, 0, sizeof(*w));
+    w->t0        = esp_timer_get_time();
+    w->speech_at = -1;
+    w->peak_db   = -100.0f;
+    w->min_free  = 1.0f;
+}
+
+static void win_log(const win_stat_t *w, const char *how)
+{
+    int64_t heard_us = (int64_t)w->heard * 1000 / s_spms;
+    char sp[48] = "没有";
+    if (w->speech_at >= 0)
+        snprintf(sp, sizeof(sp), "%d ms，从第 %d ms 开始", w->speech / s_spms, w->speech_at / s_spms);
+    ESP_LOGI(TAG, "诊断[%s] 听了 %d ms / 过了 %d ms | 静音 %d ms 等注册 %d ms | "
+             "MultiNet 占实时 %d%% 最长一帧 %d ms | 缓冲最少剩 %.0f%% | 人声 %s，峰值 %.0f dB",
+             how, (int)(heard_us / 1000), (int)((esp_timer_get_time() - w->t0) / 1000),
+             w->muted / s_spms, (int)(w->wait_us / 1000),
+             heard_us ? (int)(w->det_us * 100 / heard_us) : 0, w->det_max_us / 1000,
+             w->min_free * 100, sp, w->peak_db);
+}
+
+static bool all_zero(const int16_t *d, int n)
+{
+    for (int i = 0; i < n; i++)
+        if (d[i]) return false;
+    return true;
+}
+
+static void to_idle(void)
+{
+    s_afe->enable_wakenet(s_afe_d);
+    s_afe->reset_buffer(s_afe_d);
+}
+
 static void detect_task(void *arg)
 {
     ESP_LOGI(TAG, "detect 任务启动: mn_chunk=%d afe_chunk=%d",
              s_mn->get_samp_chunksize(s_mn_d), s_afe->get_fetch_chunksize(s_afe_d));
 
-    bool    listening  = false;
-    bool    got_cmd    = false;   /* 本次唤醒后是否已识别到命令 */
-    bool    need_clean = false;
-    int64_t deadline   = 0;
+    bool listening  = false;
+    bool got_cmd    = false;   /* 本次唤醒后是否已识别到命令 */
+    bool need_clean = false;
+    int  left       = 0;       /* 窗口还剩多少采样 */
+    win_stat_t w;
+    win_reset(&w);
 
     for (;;) {
         afe_fetch_result_t *res = s_afe->fetch(s_afe_d);
         if (!res || res->ret_value == ESP_FAIL) continue;
-        int64_t now = esp_timer_get_time();
+        int n = res->data_size / (int)sizeof(int16_t);
 
-        if (res->wakeup_state == WAKENET_DETECTED) {
+        if (!listening) {
+            if (res->wakeup_state != WAKENET_DETECTED) continue;
             ESP_LOGI(TAG, "★ 唤醒（你好小智） 音量 %.1f dB", res->data_volume);
+            s_afe->disable_wakenet(s_afe_d);         /* 等命令期间 CPU1 只跑 MultiNet */
             listening  = true;
             got_cmd    = false;
             need_clean = true;
-            deadline   = now + (int64_t)s_cfg.listen_ms * 1000;
+            left       = s_cfg.listen_ms * s_spms;
+            win_reset(&w);
             if (s_cb) s_cb(SR_EVT_WAKE);
             continue;
         }
-        if (!listening) continue;
 
-        int window_ms = got_cmd ? s_cfg.follow_up_ms : s_cfg.listen_ms;
-        if (s_muted) {
-            /* 播放中不计时：放完后重新给满一个窗口 */
-            deadline   = now + (int64_t)window_ms * 1000;
+        if (res->ringbuff_free_pct < w.min_free) w.min_free = res->ringbuff_free_pct;
+        if (all_zero(res->data, n)) {                /* 播放中：不计时，放完给满一个窗口 */
+            w.muted   += n;
+            left       = (got_cmd ? s_cfg.follow_up_ms : s_cfg.listen_ms) * s_spms;
             need_clean = true;
             continue;
         }
-        if (xSemaphoreTake(s_lock, 0) != pdTRUE) continue;   /* 正在切换命令词 */
+        if (xSemaphoreTake(s_lock, 0) != pdTRUE) {   /* 正在重新注册命令词 */
+            int64_t t = esp_timer_get_time();
+            xSemaphoreTake(s_lock, portMAX_DELAY);
+            w.wait_us += esp_timer_get_time() - t;
+        }
 
         if (need_clean) { s_mn->clean(s_mn_d); need_clean = false; }
+        int64_t t0 = esp_timer_get_time();
         esp_mn_state_t st = s_mn->detect(s_mn_d, res->data);
+        int us = (int)(esp_timer_get_time() - t0);
         int cmd = 0;
         bool hit = false;
         if (st == ESP_MN_STATE_DETECTED) {
@@ -229,26 +300,39 @@ static void detect_task(void *arg)
                     ESP_LOGI(TAG, "  候选%d: id=%d prob=%.3f", i, r->command_id[i], r->prob[i]);
             }
         } else if (st == ESP_MN_STATE_TIMEOUT) {
-            /* 超时以本任务的截止时间为准；模型自己的计时从头再来 */
+            /* 超时以本任务的窗口为准；模型自己的计时从头再来 */
             s_mn->clean(s_mn_d);
         }
         xSemaphoreGive(s_lock);
 
+        w.det_us += us;
+        if (us > w.det_max_us) w.det_max_us = us;
+        if (res->vad_state == VAD_SPEECH) {
+            if (w.speech_at < 0) w.speech_at = w.heard;
+            w.speech += n;
+        }
+        if (res->data_volume > w.peak_db) w.peak_db = res->data_volume;
+        w.heard += n;
+        left    -= n;
+
         if (hit) {
+            win_log(&w, "识别到");
             got_cmd = true;
             if (s_cb) s_cb(cmd);
             if (s_cfg.follow_up_ms > 0) {
-                deadline   = now + (int64_t)s_cfg.follow_up_ms * 1000;
+                left       = s_cfg.follow_up_ms * s_spms;
                 need_clean = true;
+                win_reset(&w);
             } else {
                 listening = false;
-                s_afe->reset_buffer(s_afe_d);
+                to_idle();
             }
-        } else if (now > deadline) {
+        } else if (left <= 0) {
             ESP_LOGI(TAG, "%s", got_cmd ? "连续对话结束，回到待唤醒" : "没听到命令，回到待唤醒");
+            win_log(&w, got_cmd ? "连续对话" : "超时");
             if (!got_cmd && s_cb) s_cb(SR_EVT_TIMEOUT);
             listening = false;
-            s_afe->reset_buffer(s_afe_d);
+            to_idle();
         }
     }
 }
@@ -278,10 +362,14 @@ bool app_sr_start(sr_cmd_cb_t cb, const sr_config_t *cfg)
     ESP_LOGI(TAG, "WakeNet 默认模式 %d（0=DET_MODE_90 常规, 1=DET_MODE_95 灵敏）",
              (int)afe_cfg->wakenet_mode);
     if (s_cfg.wake_high) afe_cfg->wakenet_mode = DET_MODE_95;
+    /* 切组重新注册命令词要 2~3 秒，这期间 detect 等锁不取数，缓冲要装得下（每帧 32 ms）*/
+    ESP_LOGI(TAG, "AFE 缓冲默认 %d 帧，内存模式 %d", afe_cfg->afe_ringbuf_size, (int)afe_cfg->memory_alloc_mode);
+    if (afe_cfg->afe_ringbuf_size < 128) afe_cfg->afe_ringbuf_size = 128;
 
     s_afe   = esp_afe_handle_from_config(afe_cfg);
     s_afe_d = s_afe->create_from_config(afe_cfg);
     if (!s_afe_d) { ESP_LOGE(TAG, "AFE 创建失败"); return false; }
+    s_spms = s_afe->get_samp_rate(s_afe_d) / 1000;
 
     char *mn_name = esp_srmodel_filter(models, ESP_MN_PREFIX, ESP_MN_CHINESE);
     if (!mn_name) { ESP_LOGE(TAG, "没有中文命令词模型"); return false; }

@@ -24,6 +24,11 @@ CONFIG_SR_WN_WN10_NIHAOXIAOZHI=y
 # 命令词: MultiNet7 中文（量化版）
 CONFIG_SR_MN_CN_MULTINET7_QUANT=y
 # 模型存放在 flash 的 model 分区（CONFIG_MODEL_IN_FLASH 默认生效，分区表已预留 3.9MB）
+# 算力：esp-sr 推荐 240 MHz + 64 KB 数据缓存。160 MHz / 32 KB 时唤醒词和命令词同在 CPU1
+# 上算不过来，任务看门狗报过 IDLE1 饿死，唤醒后的话也跟着丢
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_ESP32S3_DATA_CACHE_64KB=y
+CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
 
 # ---- FATFS 中文长文件名支持 ----
 # 学习清单用中文命名（如「一年级上册第三单元.txt」），家长自建时更直观。
