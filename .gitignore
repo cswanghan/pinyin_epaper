@@ -1,6 +1,8 @@
 # 生成物（可由脚本重建，体积大）
 content/out/
 content/.venv/
+content/node_modules/
+content/package-lock.json
 content/data/hanzi-chars/
 content/data/hanzi-words/
 content/data/hanzi-data/

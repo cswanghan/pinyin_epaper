@@ -10,17 +10,12 @@
 import asyncio, sys
 from pathlib import Path
 
-from gen_audio import tts, to_wav
+from gen_audio import tts, to_wav, cn_num, TRIM
 
 BASE = Path(__file__).parent
 OUT  = BASE / "out/sys"
 TMP  = BASE / "out/.tts_tmp"
-MAX_GROUPS = 99          # 与固件 SR_MAX_GROUPS 一致
-
-# edge-tts 输出前面约 0.2 秒、后面约 1 秒静音。固件播放期间给语音识别喂静音（防自激），
-# 尾巴上的静音等于白白多「聋」1 秒，所以首尾裁掉，只留 0.05 / 0.15 秒
-TRIM = ("silenceremove=start_periods=1:start_threshold=-50dB:start_silence=0.05,areverse,"
-        "silenceremove=start_periods=1:start_threshold=-50dB:start_silence=0.15,areverse")
+MAX_GROUPS = 99          # 与固件 GROUPS_MAX 一致（切组提示，控制台 g N 用）
 
 PROMPTS = {
     "busy":     "等一下哦",              # 刷屏中说了翻页类命令
@@ -28,16 +23,8 @@ PROMPTS = {
     "forgot":   "好的，再学一遍",        # 忘了
     "all_done": "这一组都会了，真棒！",  # 本组没有未掌握的字
     "bye":      "再见",                  # 关机
+    "not_found": "没听清，再说一遍",     # 听到「…的X」但对不上是哪个字
 }
-
-CN = "零一二三四五六七八九"
-
-def cn_num(n: int) -> str:
-    """1..99 → 中文数字，交给 TTS 读更稳定"""
-    if n < 10:
-        return CN[n]
-    tens, ones = divmod(n, 10)
-    return ("" if tens == 1 else CN[tens]) + "十" + ("" if ones == 0 else CN[ones])
 
 async def gen(key, text, sem, force, stats):
     wav = OUT / f"{key}.wav"

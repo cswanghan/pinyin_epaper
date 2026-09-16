@@ -6,8 +6,8 @@
  * 任务划分:
  *   cmd_task      唯一持有学习状态（当前组 / 当前字 / 掌握标记）。语音、按键、
  *                 控制台都只往 s_cmd_q 投递命令，由它串行处理 —— 不用加锁
- *   display_task  刷屏（阻塞约 20 秒）。刷屏期间只接受"重播字音 / 读词组"，
- *                 其余命令回一句「等一下哦」，避免排队的命令在 20 秒后突然生效
+ *   display_task  刷屏（阻塞约 20 秒，面板波形掐不断）。刷屏期间命令照常执行:
+ *                 换字排进深度 1 的显示队列（后者覆盖前者），这一张刷完直接刷最新的
  *   audio_task    朗读与提示音（app_audio.cpp），与刷屏并行，掩盖等待
  *   sr_*          离线语音（app_sr.cpp）
  *****************************************************************************/
@@ -33,6 +33,7 @@
 #include "app_sr.h"
 #include "app_audio.h"
 #include "app_store.h"
+#include "app_stroke.h"
 #include "app_power.h"
 #include "app_console.h"
 
@@ -48,7 +49,6 @@
 #define PROGRESS_PATH  SD_ROOT "/progress.txt"
 
 #define EXPORT_DELAY_US     (30LL * 1000 * 1000)  /* 进度变化后空闲 30 秒再导出 */
-#define BUSY_PROMPT_GAP_US  (2LL * 1000 * 1000)   /* 「等一下哦」不要连着说 */
 
 /* 按键事件位（button_bsp.c 的回调里定义，与 multi_button 的枚举值无关）*/
 #define BOOT_SINGLE  0
@@ -71,8 +71,7 @@ static bool     s_sr_ready   = false;
 static bool     s_dirty      = false;   /* 进度有变化，还没导出 */
 static int64_t  s_dirty_at   = 0;
 static int64_t  s_active_at  = 0;       /* 最近一次操作，用于自动关机 */
-static int64_t  s_busy_said  = 0;
-static int64_t  s_show_at    = 0;       /* 换组后推迟到这个时刻再呈现，0 = 没有 */
+static scope_t *s_lookup     = NULL;    /* 查字表 = 所有清单合起来，开机读一次 */
 
 static QueueHandle_t  s_cmd_q     = NULL;
 static QueueHandle_t  s_disp_q    = NULL;
@@ -136,24 +135,45 @@ static void display_task(void *arg)
     for (;;) {
         if (xQueueReceive(s_disp_q, &code, portMAX_DELAY) != pdTRUE) continue;
         int id = code / 2;
-        if (load_image(id)) {
+        /* 插队换字会在队列里留下已经在屏上的字（刷 X 时换成 Y 又换回 X）。刷屏期间
+         * shown 是 -1，request_display 那道「画面没变」挡不住，只能在这儿再挡一次 */
+        if (code == app_store_get_shown()) {
+            ESP_LOGI(TAG, "id=%d 已经在屏上，这一轮跳过", id);
+        } else if (load_image(id)) {
             if (code & 1) draw_check(s_epd_buf);
             app_store_set_shown(-1);              /* 刷到一半断电 → 下次开机必刷 */
             ESP_LOGI(TAG, "刷屏 id=%d%s（约 20 秒）", id, (code & 1) ? " ✓" : "");
-            int64_t t0 = esp_timer_get_time();
+            /* 笔顺在这儿念，不在 show() 里念：插队排进来的字要等上一张刷完，
+             * 在 show() 里念的话念完了字还没开始出现。（插队的字字音和词组早就播过了，
+             * app_stroke_speak 仍按它俩还在前面算 head，摊出来的停顿偏小、比刷屏早念完
+             * 几秒 —— 早一点正是想要的，不值得为它多开一个接口）*/
+            if (s_cfg.stroke_order) app_stroke_speak(id, s_cfg.stroke_gap_ms);
+            int64_t t0 = esp_timer_get_time();       /* 笔顺正是从这一刻开始念的 */
             epaper_port_display(s_epd_buf);
             app_store_set_shown(code);
-            ESP_LOGI(TAG, "刷屏完成 %.1f 秒", (esp_timer_get_time() - t0) / 1e6);
+            int ms = (int)((esp_timer_get_time() - t0) / 1000);
+            ESP_LOGI(TAG, "刷屏完成 %.1f 秒", ms / 1000.0);
+            app_stroke_set_window(ms);               /* 下一个字按这次的实测窗口摊停顿 */
         }
         if (uxQueueMessagesWaiting(s_disp_q) == 0) s_disp_busy = false;
     }
 }
 
+/* 排一次刷屏。画面本来就对（开机恢复上次的字、重复按同一个字）就不刷 ——
+ * 不刷就没有那 17.6 秒的空档，display_task 也就不会念笔顺 */
 static void request_display(int id)
 {
     int code = id * 2 + (app_store_is_mastered(id) ? 1 : 0);
     if (code == app_store_get_shown()) { ESP_LOGI(TAG, "画面没变，不刷屏"); return; }
-    s_disp_busy = true;                           /* 先置忙，再投递，不给命令插空子 */
+    if (s_disp_busy) {
+        /* 查错了字不用干等着刷完: 队列深度 1、后者覆盖前者，这一张刷完直接刷最新的。
+         * 但面板那 17.6 秒的波形掐不断（见 epaper_port_display），插队省掉的是错字的
+         * 笔顺朗读和再喊一遍，不是那 17.6 秒。字音和词组已经排在前面了，孩子知道听见了，
+         * 再补一句「等一下哦」，免得后面这十几秒静音显得像死机 */
+        ESP_LOGI(TAG, "正在刷屏，id=%d 排队，刷完接着上", id);
+        app_audio_prompt("busy", TONE_BUSY);
+    }
+    s_disp_busy = true;
     xQueueOverwrite(s_disp_q, &code);
 }
 
@@ -174,10 +194,11 @@ static void mark_dirty(void)
     s_dirty_at = esp_timer_get_time();
 }
 
-/* 呈现当前字：记进度 → 读字音和词组 → 刷屏（三者并行）*/
+/* 呈现当前字：记进度 → 读字音和词组 → 刷屏（三者并行）。
+ * 刷屏要 17.6 秒，字音 + 词组只占 4 秒左右，剩下的空档用笔顺填上：
+ * 孩子跟着读音和笔顺在纸上写，写完抬头，字刚好出现在屏幕上 */
 static void show(void)
 {
-    s_show_at = 0;
     int id = cur_id();
     if (id < 0) return;
     ESP_LOGI(TAG, "→ %s 第 %d/%d 个「%s」 id=%d%s", s_scope->name[0] ? s_scope->name : "全部字",
@@ -185,7 +206,7 @@ static void show(void)
     app_store_save_pos(s_scope->name, id);
     app_audio_play_char(id, 'c');
     app_audio_play_char(id, 'w');
-    request_display(id);
+    request_display(id);                          /* 笔顺由 display_task 在刷屏开始时念 */
 }
 
 static void goto_pos(int pos)
@@ -208,26 +229,63 @@ static int find_unmastered(int start)
     return -1;
 }
 
-static void sr_update_scope(void)
+/* 把第 g 组装进 s_scope（先装到备用的，装成功再交换）*/
+static bool load_group(int g)
 {
-    if (s_sr_ready)
-        app_sr_set_scope(s_scope->phrases, s_scope->n, app_groups_count());
+    if (!scope_load(s_scope_alt, SCOPE_DIR, app_groups_name(g), s_total)) return false;
+    scope_t *t = s_scope; s_scope = s_scope_alt; s_scope_alt = t;
+    s_group = g;
+    return true;
 }
 
-/* 换组后推迟呈现的时长：连续对话窗口 + 1 秒（窗口末尾说的话还要识别完）*/
-static int64_t defer_us(void) { return (int64_t)(s_cfg.follow_up_seconds + 1) * 1000 * 1000; }
+static int pos_of(int id)
+{
+    for (int i = 0; i < s_scope->n; i++)
+        if (s_scope->ids[i] == id) return i;
+    return -1;
+}
 
+/* 下一个 / 上一个：到组尾接着下一组的第一个字，在组头往前是上一组的最后一个字。
+ * 语音不能切组（查字不分组），靠这个把所有组串起来 */
+static void step(int d)
+{
+    int pos = s_pos + d, gc = app_groups_count();
+    if ((pos < 0 || pos >= s_scope->n) && s_group >= 0 && gc > 1) {
+        int g = ((s_group + d) % gc + gc) % gc;
+        if (load_group(g)) {
+            pos = d > 0 ? 0 : s_scope->n - 1;
+            ESP_LOGI(TAG, "%s第 %d 组 %s（%d 字）", d > 0 ? "接着学" : "回到", g + 1, s_scope->name, s_scope->n);
+        }
+    }
+    goto_pos(pos);
+}
+
+/* 查字：本组有就在组内跳，没有就换到它所在的组 */
+static void jump_to_char(int id)
+{
+    int pos = pos_of(id);
+    if (pos < 0) {
+        int g = app_groups_of(id);
+        if (g < 0 || !load_group(g)) {
+            ESP_LOGW(TAG, "清单里没有字 id=%d", id);
+            app_audio_stop();
+            app_audio_prompt("not_found", TONE_TIMEOUT);
+            return;
+        }
+        pos = pos_of(id);
+        if (pos < 0) pos = 0;                          /* 开机后清单文件被改过 */
+        ESP_LOGI(TAG, "查字 → 第 %d 组 %s", g + 1, s_scope->name);
+    }
+    goto_pos(pos);
+}
+
+/* 切组，只有控制台能切（调试用）*/
 static void switch_group(int g)
 {
     int gc = app_groups_count();
     if (gc == 0) { ESP_LOGW(TAG, "SD 卡上没有学习清单"); app_audio_tone(TONE_TIMEOUT); return; }
     g = ((g % gc) + gc) % gc;
-    if (!scope_load(s_scope_alt, SCOPE_DIR, app_groups_name(g), s_total)) {
-        app_audio_tone(TONE_TIMEOUT);
-        return;
-    }
-    scope_t *t = s_scope; s_scope = s_scope_alt; s_scope_alt = t;
-    s_group = g;
+    if (!load_group(g)) { app_audio_tone(TONE_TIMEOUT); return; }
     int first = find_unmastered(0);
     s_pos = first < 0 ? 0 : first;
     ESP_LOGI(TAG, "切换到第 %d 组 %s（%d 字）", g + 1, s_scope->name, s_scope->n);
@@ -237,17 +295,8 @@ static void switch_group(int g)
     snprintf(key, sizeof(key), "group_%02d", g + 1);
     app_audio_prompt(key, TONE_GROUP);
     if (first < 0) app_audio_prompt("all_done", TONE_DONE);
-    sr_update_scope();
     mark_dirty();
-
-    /* 先不呈现：换组后常常紧接着说要学的字（「如果的如」）。等一个连续对话窗口，
-     * 说了就直接刷到那个字，没说再呈现本组第一个字 —— 刷一次屏 21 秒，别白刷 */
-    if (s_sr_ready && s_cfg.follow_up_seconds > 0) {
-        s_show_at = esp_timer_get_time() + defer_us();
-        ESP_LOGI(TAG, "先不刷屏，提示音放完再等 %d 秒，看要不要跳字", s_cfg.follow_up_seconds + 1);
-    } else {
-        show();
-    }
+    show();
 }
 
 static void log_status(void)
@@ -265,13 +314,14 @@ static void log_status(void)
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 }
 
-/* 列出本组的字和跳字说法 —— 跳字命令只注册了本组，别的组的字说了不会有反应 */
+/* 列出本组的字、字 id 和查字说法（控制台 c 汉字 / c 字id 查字）*/
 static void log_scope(void)
 {
-    if (!s_scope->name[0]) { ESP_LOGI(TAG, "没有学习清单（全部字模式），没有跳字命令"); return; }
-    ESP_LOGI(TAG, "第 %d 组 %s 共 %d 字，跳字说法:", s_group + 1, s_scope->name, s_scope->n);
+    if (!s_scope->name[0]) { ESP_LOGI(TAG, "没有学习清单（全部字模式），不能语音查字"); return; }
+    ESP_LOGI(TAG, "第 %d 组 %s 共 %d 字（查字表共 %d 字），字 id 和查字说法:",
+             s_group + 1, s_scope->name, s_scope->n, s_lookup ? s_lookup->n : 0);
     for (int i = 0; i < s_scope->n; i++)
-        ESP_LOGI(TAG, "  c %-3d %s%s  %s", i, s_scope->chars[i],
+        ESP_LOGI(TAG, "  %-4d %s%s  %s", s_scope->ids[i], s_scope->chars[i],
                  app_store_is_mastered(s_scope->ids[i]) ? "✓" : " ",
                  s_scope->phrases[i][0] ? s_scope->phrases[i] : "(无)");
 }
@@ -282,48 +332,36 @@ static void power_off(const char *why)
     app_audio_stop();
     app_audio_prompt("bye", TONE_BYE);
     for (int i = 0; i < 50 && !app_audio_idle(); i++) vTaskDelay(pdMS_TO_TICKS(100));
-    /* 刷屏中途断电会让墨水屏停在半刷状态，等它刷完 */
-    for (int i = 0; i < 300 && s_disp_busy; i++) vTaskDelay(pdMS_TO_TICKS(100));
+    /* 刷屏中途断电会让墨水屏停在半刷状态，等它刷完。插队换字时队列里可能还压着一张，
+     * s_disp_busy 要跨两次刷屏（17.6×2 = 35.2 秒）才落下，上限给到 40 秒 */
+    for (int i = 0; i < 400 && s_disp_busy; i++) vTaskDelay(pdMS_TO_TICKS(100));
     if (s_dirty) export_progress();
     epaper_port_sleep();
     app_power_off();
 }
 
-/* 刷屏期间仍然可以执行的命令：只出声、不换画面 */
-static bool audio_only(int cmd) { return cmd == SR_CMD_REPEAT || cmd == SR_CMD_WORDS; }
-
+/* 刷屏期间命令照常执行，不再挡着: 换字排进显示队列（深度 1，后者覆盖前者），
+ * 这一张刷完直接刷最新的那个 —— 查错了字不用干等着它刷完。错字的笔顺朗读由
+ * goto_pos 里那句 app_audio_stop() 当场掐掉 */
 static void handle_learn_cmd(int cmd)
 {
-    if (s_disp_busy && !audio_only(cmd)) {
-        ESP_LOGI(TAG, "正在刷屏，命令 %d 不执行", cmd);
-        int64_t now = esp_timer_get_time();
-        if (now - s_busy_said > BUSY_PROMPT_GAP_US) {
-            s_busy_said = now;
-            app_audio_prompt("busy", TONE_BUSY);
-        }
-        return;
-    }
     int id = cur_id();
     if (id < 0) return;
-    if (s_show_at && cmd == SR_CMD_NEXT) { show(); return; }   /* 换组后还没呈现：下一个就是本组第一个字 */
 
-    if (cmd >= SR_CMD_GROUP_BASE) {
-        int g = cmd - SR_CMD_GROUP_BASE;               /* 从 1 开始 */
+    if (cmd >= APP_CMD_GROUP_BASE) {                   /* 控制台 g N，N 从 1 开始 */
+        int g = cmd - APP_CMD_GROUP_BASE;
         if (g < 1 || g > app_groups_count()) { ESP_LOGW(TAG, "没有第 %d 组", g); return; }
         switch_group(g - 1);
         return;
     }
-    if (cmd >= SR_CMD_CHAR_BASE) {                     /* 「如果的如」→ 清单第 N 个字 */
-        int idx = cmd - SR_CMD_CHAR_BASE;
-        if (idx >= s_scope->n) return;
-        ESP_LOGI(TAG, "跳到本组第 %d 个字", idx + 1);
-        goto_pos(idx);
+    if (cmd >= SR_CMD_CHAR_BASE) {                     /* 「如果的如」→ 如的字 id */
+        jump_to_char(cmd - SR_CMD_CHAR_BASE);
         return;
     }
 
     switch (cmd) {
-    case SR_CMD_NEXT:   goto_pos(s_pos + 1); break;
-    case SR_CMD_PREV:   goto_pos(s_pos - 1); break;
+    case SR_CMD_NEXT:   step(1); break;
+    case SR_CMD_PREV:   step(-1); break;
     case SR_CMD_REPEAT: app_audio_stop(); app_audio_play_char(id, 'c'); break;
     case SR_CMD_WORDS:  app_audio_stop(); app_audio_play_char(id, 'w'); break;
 
@@ -361,11 +399,17 @@ static void handle_learn_cmd(int cmd)
         app_audio_prompt("forgot", TONE_FORGOT);
         app_audio_play_char(id, 'c');
         app_audio_play_char(id, 'w');
-        if (changed) { mark_dirty(); request_display(id); }   /* 去掉红勾 */
+        /* 去掉红勾要刷屏，同样是 17.6 秒的空档。孩子说「忘了」正是最该跟着笔顺
+         * 重写一遍的时候，所以这里也念（display_task 里刷屏一开始就念）。
+         * head 里还多一句 forgot 提示音没算进去，摊出来的停顿会偏大一点点 */
+        if (changed) {
+            mark_dirty();
+            request_display(id);
+        }
         break;
     }
-    case SR_CMD_GROUP_NEXT: switch_group(s_group + 1); break;
-    case SR_CMD_GROUP_PREV: switch_group(s_group - 1); break;
+    case APP_CMD_GROUP_NEXT: switch_group(s_group + 1); break;
+    case APP_CMD_GROUP_PREV: switch_group(s_group - 1); break;
     default: break;
     }
 }
@@ -375,13 +419,25 @@ static void handle_cmd(int cmd)
     switch (cmd) {
     case EVT_SR_READY:
         s_sr_ready = true;
-        sr_update_scope();
+        if (s_lookup) app_sr_set_lookup(s_lookup->ids, s_lookup->phrases, s_lookup->n);
+        else ESP_LOGW(TAG, "没有学习清单，只有固定命令，不能查字");
         ESP_LOGI(TAG, "语音就绪 —— 说「你好小智」唤醒");
         return;
+    case SR_EVT_NOT_FOUND:  app_audio_prompt("not_found", TONE_TIMEOUT); break;
     case APP_EVT_STATUS:    log_status(); return;
     case APP_EVT_LIST:      log_scope(); return;
     case APP_EVT_EXPORT:    export_progress(); return;
     case APP_EVT_POWER_OFF: power_off("长按 PWR"); return;
+    case APP_EVT_WAKE_KEY:
+        /* 不用喊「你好小智」，按一下就能说话。按这个键就表示「我要说话了」，
+         * 所以先把正在念的笔顺掐掉 —— 不然孩子得等十几秒才轮到自己开口，
+         * 而且播放期间麦克风是屏蔽的（见 app_sr 的静音帧不计时），压根听不见。
+         * 提示音不在这儿放: app_sr 进了监听窗口才回调 SR_EVT_WAKE，由下面那行放 */
+        if (!s_sr_ready) { ESP_LOGW(TAG, "语音还没就绪，按键唤醒无效"); return; }
+        ESP_LOGI(TAG, "按键唤醒 → 等孩子说话");
+        app_audio_stop();
+        app_sr_wake();
+        break;
     case SR_EVT_WAKE:       app_audio_prompt("wake", TONE_WAKE); break;
     case SR_EVT_TIMEOUT:    app_audio_prompt("timeout", TONE_TIMEOUT); break;
     default:                if (cmd >= 0) handle_learn_cmd(cmd); break;
@@ -394,13 +450,9 @@ static void command_task(void *arg)
     s_active_at = esp_timer_get_time();
     for (;;) {
         int cmd;
-        if (xQueueReceive(s_cmd_q, &cmd, pdMS_TO_TICKS(s_show_at ? 100 : 1000)) == pdTRUE) handle_cmd(cmd);
+        if (xQueueReceive(s_cmd_q, &cmd, pdMS_TO_TICKS(1000)) == pdTRUE) handle_cmd(cmd);
 
         int64_t now = esp_timer_get_time();
-        if (s_show_at) {                                  /* 换组后推迟的呈现：提示音放完才开始计时 */
-            if (!app_audio_idle()) s_show_at = now + defer_us();
-            else if (now >= s_show_at) show();
-        }
         bool idle = !s_disp_busy && app_audio_idle();
         if (s_dirty && idle && now - s_dirty_at > EXPORT_DELAY_US) export_progress();
 
@@ -413,8 +465,10 @@ static void command_task(void *arg)
 }
 
 /* ======================= 按键 ======================= */
-/* BOOT: 单击 下一个   双击 重播字音   长按 读词组
- * PWR : 单击 我会了   双击 复习       长按 关机 */
+/* BOOT: 单击 唤醒（等孩子说话）  双击 下一个   长按 读词组
+ * PWR : 单击 我会了              双击 复习     长按 关机
+ * 单击 BOOT 是最常用的那一下，给了唤醒: 喊唤醒词不一定能唤上（周围吵、声音小），
+ * 按键百分之百唤得上。代价是「重播字音」没有按键了，只剩说「再读一遍」和控制台 r */
 static void button_task(void *arg)
 {
     /* 电池开机就是按住 PWR：松手 0.5 秒前的 PWR 事件都不算，否则一开机就被当成长按关机 */
@@ -429,8 +483,8 @@ static void button_task(void *arg)
 
         /* 双击 / 长按时单击位也可能同时置起，按优先级判断 */
         if      (get_bit_button(b, BOOT_LONG))   { ESP_LOGI(TAG, "长按 BOOT → 读词组"); post_cmd(SR_CMD_WORDS); }
-        else if (get_bit_button(b, BOOT_DOUBLE)) { ESP_LOGI(TAG, "双击 BOOT → 重播");   post_cmd(SR_CMD_REPEAT); }
-        else if (get_bit_button(b, BOOT_SINGLE)) { ESP_LOGI(TAG, "单击 BOOT → 下一个"); post_cmd(SR_CMD_NEXT); }
+        else if (get_bit_button(b, BOOT_DOUBLE)) { ESP_LOGI(TAG, "双击 BOOT → 下一个"); post_cmd(SR_CMD_NEXT); }
+        else if (get_bit_button(b, BOOT_SINGLE)) { ESP_LOGI(TAG, "单击 BOOT → 唤醒");   post_cmd(APP_EVT_WAKE_KEY); }
 
         if      (get_bit_button(p, PWR_LONG))    { ESP_LOGI(TAG, "长按 PWR → 关机");    post_cmd(APP_EVT_POWER_OFF); }
         else if (get_bit_button(p, PWR_DOUBLE))  { ESP_LOGI(TAG, "双击 PWR → 复习");    post_cmd(SR_CMD_REVIEW); }
@@ -509,11 +563,12 @@ void user_app_init(void)
         return;
     }
 
-    int cap = s_total > SR_MAX_SCOPE_CHARS ? s_total : SR_MAX_SCOPE_CHARS;
-    s_scope     = scope_new(cap);
-    s_scope_alt = scope_new(cap);
+    s_scope     = scope_new(s_total);
+    s_scope_alt = scope_new(s_total);
     assert(s_scope && s_scope_alt);
     app_groups_scan(SCOPE_DIR);
+    s_lookup = app_groups_load_all(s_total);   /* 查字表: 所有清单合起来 */
+    app_stroke_init(SD_ROOT, s_total);         /* 笔顺朗读；老卡上没有 stroke/ 就自动关掉 */
     restore_position();
 
     s_disp_q = xQueueCreate(1, sizeof(int));

@@ -1,0 +1,10 @@
+{
+  "name": "pinyin-epaper-content",
+  "version": "1.0.0",
+  "private": true,
+  "description": "gen_stroke_order.py 用的笔顺数据源。只在重建 data/stroke_order.txt 时才需要装，日常跑 gen_stroke.py 用不到。",
+  "dependencies": {
+    "cnchar": "3.2.6",
+    "cnchar-order": "3.2.6"
+  }
+}

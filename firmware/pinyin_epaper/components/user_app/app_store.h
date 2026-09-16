@@ -21,11 +21,13 @@ extern "C" {
 /* ---------- config.txt ---------- */
 typedef struct {
     int   volume;              /* 0-100 */
-    bool  wake_high;           /* wake_sensitivity=high */
+    bool  wake_high;           /* wake_sensitivity=high（默认），normal 为 false */
     float mn_threshold;        /* 0 = 模型默认 */
     int   listen_seconds;      /* 唤醒后等命令 */
     int   follow_up_seconds;   /* 连续对话，0 = 关 */
     int   sleep_minutes;       /* 无操作自动关机，0 = 不关 */
+    bool  stroke_order;        /* 刷屏时念笔顺（默认开）*/
+    int   stroke_gap_ms;       /* 笔画之间停顿，0 = 自动（按刷屏时长反推）*/
 } app_config_t;
 
 void app_store_load_config(const char *path, app_config_t *cfg);
@@ -46,7 +48,7 @@ typedef struct {
     int          n, cap;
     int         *ids;
     const char **chars;                 /* 汉字（UTF-8），指向 buf */
-    const char **phrases;               /* 跳字说法，可能是 "" */
+    const char **phrases;               /* 查字说法，可能是 "" */
     char        *buf;
     size_t       buf_cap;
 } scope_t;
@@ -56,6 +58,12 @@ int         app_groups_count(void);
 const char *app_groups_name(int g);
 int         app_groups_find(const char *name);  /* 找不到返回 -1 */
 void        app_groups_grep(const char *query); /* 在所有清单里找含 query 的行（汉字或拼音），打印组号 */
+
+/* 查字表: 所有清单合起来（按组的顺序，同一个字只留第一次出现的），并记下每个字在第几组。
+ * app_groups_scan 之后调一次，返回的 scope 一直有效；没有清单返回 NULL */
+scope_t    *app_groups_load_all(int total);
+int         app_groups_of(int id);              /* 字 id 在第几组，不在清单里返回 -1 */
+int         app_groups_char_id(const char *ch); /* 汉字 → 字 id（在查字表里找），找不到返回 -1 */
 
 scope_t *scope_new(int cap);
 void     scope_free(scope_t *s);

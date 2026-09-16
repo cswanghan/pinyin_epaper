@@ -1,5 +1,5 @@
 idf_component_register(
-  SRCS "user_app.cpp" "app_sr.cpp" "app_audio.cpp" "app_store.cpp" "app_power.cpp" "app_console.cpp"
+  SRCS "user_app.cpp" "app_sr.cpp" "app_audio.cpp" "app_store.cpp" "app_stroke.cpp" "app_power.cpp" "app_console.cpp"
   PRIV_REQUIRES
   board_power_bsp
   driver

@@ -36,6 +36,7 @@ void app_audio_play_file(const char *path);     /* 排队播放 WAV */
 void app_audio_play_char(int id, char kind);    /* 'c' 字音 / 'w' 词组 */
 void app_audio_prompt(const char *key, tone_t fallback);
 void app_audio_tone(tone_t tone);
+void app_audio_gap(int ms);                     /* 排一段静默（念笔顺时留给孩子跟着写）*/
 
 /* 丢弃排队中的请求并打断正在播放的朗读（切字时用，避免旧字的声音拖尾）*/
 void app_audio_stop(void);

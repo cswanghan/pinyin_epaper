@@ -7,6 +7,7 @@
  *****************************************************************************/
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -25,7 +26,8 @@ static const struct { const char *name; int cmd; } k_cmds[] = {
     {"n", SR_CMD_NEXT},       {"p", SR_CMD_PREV},
     {"r", SR_CMD_REPEAT},     {"w", SR_CMD_WORDS},
     {"m", SR_CMD_MASTERED},   {"f", SR_CMD_FORGOT},     {"v", SR_CMD_REVIEW},
-    {"gn", SR_CMD_GROUP_NEXT}, {"gp", SR_CMD_GROUP_PREV},
+    {"gn", APP_CMD_GROUP_NEXT}, {"gp", APP_CMD_GROUP_PREV},
+    {"k", APP_EVT_WAKE_KEY},
     {"wake", SR_EVT_WAKE},    {"timeout", SR_EVT_TIMEOUT},
     {"s", APP_EVT_STATUS},    {"l", APP_EVT_LIST},
     {"export", APP_EVT_EXPORT}, {"off", APP_EVT_POWER_OFF},
@@ -42,15 +44,29 @@ static void run_line(char *s)
     for (const auto &c : k_cmds)
         if (strcmp(s, c.name) == 0) { s_post(c.cmd); return; }
     int n;
-    if (sscanf(s, "g %d", &n) == 1 && n >= 1 && n <= SR_MAX_GROUPS) { s_post(SR_CMD_GROUP_BASE + n); return; }
-    if (sscanf(s, "c %d", &n) == 1 && n >= 0 && n < SR_MAX_SCOPE_CHARS) { s_post(SR_CMD_CHAR_BASE + n); return; }
+    if (sscanf(s, "g %d", &n) == 1 && n >= 1 && n <= GROUPS_MAX) { s_post(APP_CMD_GROUP_BASE + n); return; }
+    if (strncmp(s, "c ", 2) == 0) {                /* 查字: c 如 / c 123 */
+        const char *q = s + 2;
+        while (*q == ' ') q++;
+        char *end;
+        long id = strtol(q, &end, 10);
+        if (end == q || *end) id = app_groups_char_id(q);   /* 不是数字就当汉字查 */
+        if (id >= 0 && id < STORE_MAX_IDS) { s_post(SR_CMD_CHAR_BASE + (int)id); return; }
+        ESP_LOGI(TAG, "清单里没有「%s」", q);
+        return;
+    }
+    if (strncmp(s, "py ", 3) == 0) {               /* 把拼音当成听到的原始文本查字: py ru guo de guo */
+        int cmd = app_sr_lookup_text(s + 3);
+        if (cmd >= SR_CMD_CHAR_BASE) s_post(cmd);
+        return;
+    }
     if (strncmp(s, "find ", 5) == 0) {
         /* 只读 SD 上的清单文件，不碰学习状态，直接在本任务里做 */
         const char *q = s + 5;
         while (*q == ' ') q++;
         if (*q) { app_groups_grep(q); return; }
     }
-    ESP_LOGI(TAG, "命令: n p r w m f v gn gp | g N 第N组 | c N 第N个字(从0起) | l 本组字表 | find 汉字或拼音 | wake timeout s export off");
+    ESP_LOGI(TAG, "命令: n p r w m f v | c 汉字或字id 查字 | py 拼音 按听到的拼音查字 | gn gp g N 切组 | l 本组字表 | find 汉字或拼音 | wake timeout s export off");
 }
 
 static void console_task(void *arg)
@@ -83,6 +99,6 @@ void app_console_start(console_post_t post)
         return;
     }
     usb_serial_jtag_vfs_use_driver();
-    xTaskCreate(console_task, "console", 4 * 1024, NULL, 2, NULL);   /* find 要读 SD */
+    xTaskCreate(console_task, "console", 6 * 1024, NULL, 2, NULL);   /* find 要读 SD，py 要算对齐 */
     ESP_LOGI(TAG, "调试控制台就绪：在 idf.py monitor 里敲命令回车，敲 ? 看帮助");
 }

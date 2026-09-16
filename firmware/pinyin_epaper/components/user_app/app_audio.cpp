@@ -25,15 +25,16 @@
 #define SAMPLE_RATE     16000
 #define PLAY_CHUNK      1024                 /* 每次写给 codec 的字节数（256 个双声道帧）*/
 #define MAX_WAV_BYTES   (512 * 1024)         /* 单个音频上限（16 秒），放 PSRAM */
-#define QUEUE_LEN       8
+#define QUEUE_LEN       64                   /* 念笔顺要排满一个字：最多 23 画 ×（笔画名 + 停顿）+ 头尾 = 50 */
 #define TAIL_SPEECH_MS  150                  /* 放完后等尾音散掉再恢复拾音 */
 #define TAIL_TONE_MS    80
 #define TONE_AMP        9800.0f              /* 约 0.3 满幅，比朗读略轻 */
 
-enum { REQ_WAV, REQ_PROMPT, REQ_TONE };
+enum { REQ_WAV, REQ_PROMPT, REQ_TONE, REQ_GAP };
 typedef struct {
     uint8_t  kind;
     uint8_t  tone;
+    uint16_t gap_ms;          /* REQ_GAP: 静默多久 —— 念笔顺时留给孩子跟着写 */
     uint32_t gen;
     char     path[96];
 } audio_req_t;
@@ -194,6 +195,12 @@ static void audio_task(void *arg)
         case REQ_PROMPT:
             if (!play_wav(r.path, true, r.gen)) { play_tone((tone_t)r.tone, r.gen); tail = TAIL_TONE_MS; }
             break;
+        case REQ_GAP:
+            /* 纯静默。不在这里恢复拾音：笔画之间开麦克风会被自己的朗读误唤醒 */
+            for (int left = r.gap_ms; left > 0 && r.gen == s_gen; left -= 50)
+                vTaskDelay(pdMS_TO_TICKS(left > 50 ? 50 : left));
+            tail = 0;
+            break;
         default:
             play_tone((tone_t)r.tone, r.gen);
             tail = TAIL_TONE_MS;
@@ -258,6 +265,17 @@ void app_audio_prompt(const char *key, tone_t fallback)
 }
 
 void app_audio_tone(tone_t tone) { enqueue(REQ_TONE, (uint8_t)tone, NULL); }
+
+void app_audio_gap(int ms)
+{
+    if (!s_q || ms <= 0) return;
+    audio_req_t r = {};
+    r.kind   = REQ_GAP;
+    r.gen    = s_gen;
+    r.gap_ms = (uint16_t)(ms > 5000 ? 5000 : ms);
+    if (xQueueSend(s_q, &r, 0) != pdTRUE)
+        ESP_LOGW(TAG, "播放队列已满，丢弃停顿");
+}
 
 void app_audio_stop(void)
 {

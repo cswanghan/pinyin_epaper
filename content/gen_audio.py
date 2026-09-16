@@ -19,6 +19,21 @@ RATE    = "-10%"          # 略慢，便于孩子听清；比 -20% 自然
 CONCUR  = 8               # 并发数，太高会被限流
 RETRY   = 3
 
+# edge-tts 输出前面约 0.2 秒、后面约 1 秒静音。固件播放期间给语音识别喂静音（防自激），
+# 尾巴上的静音等于白白多「聋」1 秒，所以首尾裁掉，只留 0.05 / 0.15 秒。
+# 短片段（笔画名）拼接时这段静音还会累加成明显的拖沓，gen_stroke.py 也用它
+TRIM = ("silenceremove=start_periods=1:start_threshold=-50dB:start_silence=0.05,areverse,"
+        "silenceremove=start_periods=1:start_threshold=-50dB:start_silence=0.15,areverse")
+
+_CN = "零一二三四五六七八九"
+
+def cn_num(n: int) -> str:
+    """1..99 → 中文数字，交给 TTS 读更稳定"""
+    if n < 10:
+        return _CN[n]
+    tens, ones = divmod(n, 10)
+    return ("" if tens == 1 else _CN[tens]) + "十" + ("" if ones == 0 else _CN[ones])
+
 async def tts(text: str, out_mp3: Path) -> bool:
     import edge_tts
     for attempt in range(RETRY):

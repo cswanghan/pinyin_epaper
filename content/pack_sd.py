@@ -10,6 +10,8 @@
   <SD>/pinyin/aud/0000_w.wav   词组
   <SD>/pinyin/scope/*.txt      学习清单（一组一个文件）
   <SD>/pinyin/sys/*.wav        语音提示（gen_prompts.py 生成，缺了固件用蜂鸣音代替）
+  <SD>/pinyin/stroke/bishun.txt  笔顺表（gen_stroke.py 生成，缺了就不念笔顺）
+  <SD>/pinyin/stroke/*.wav       笔画名等音频片段
   <SD>/pinyin/config.txt       设备配置（已存在则不覆盖，保留家长改过的值）
   <SD>/pinyin/progress.txt     学习进度（固件写，只读查看）
 """
@@ -28,9 +30,9 @@ CHARS   = BASE / "out/chars.json"
 DEFAULT_CONFIG = """\
 # 小学生字学习机配置 —— 改完重启设备生效，# 后面是注释
 # 音量 0-100
-volume=80
-# 唤醒灵敏度: normal 正常 / high 更灵敏（离得远也能唤醒，但误唤醒会多）
-wake_sensitivity=normal
+volume=100
+# 唤醒灵敏度: high 灵敏（默认）/ normal 误唤醒少一些，但离得远、声音小时不容易叫醒
+wake_sensitivity=high
 # 命令词识别阈值 0-1，0 = 模型默认。常把别的话听成命令就调高（如 0.3），说了没反应就调低（如 0.1）
 mn_threshold=0
 # 唤醒后等命令的秒数（2-30）
@@ -39,6 +41,12 @@ listen_seconds=6
 follow_up_seconds=6
 # 用电池时多少分钟没操作自动关机，0 = 不自动关机（插着电脑时不会自动关机）
 sleep_minutes=10
+# 刷屏时念笔顺 on/off。刷一次屏要 17.6 秒，念笔顺正好把这段等待填上：
+# 孩子跟着读音和笔顺在纸上写，写完抬头字刚好出现
+stroke_order=on
+# 笔画之间停顿多少毫秒。0 = 自动：按这个字的笔画数摊，念完刚好赶上刷屏结束。
+# 觉得太赶就填个固定值（如 800），但笔画多的字会念到字出来之后
+stroke_gap_ms=0
 """
 
 def main():
@@ -87,6 +95,16 @@ def main():
         for f in sorted(src_sys.glob("*.wav")):
             shutil.copy(f, dst / "sys" / f.name); n_sys += 1
     print(f"语音提示 {n_sys} 条" + ("" if n_sys else "（没有 out/sys，先跑 gen_prompts.py；不跑也能用，固件用蜂鸣音代替）"))
+
+    # 笔顺表 + 笔画名片段（可选）
+    src_stroke = BASE / "out/stroke"
+    n_stroke = 0
+    if src_stroke.exists():
+        (dst / "stroke").mkdir(exist_ok=True)
+        for f in sorted(src_stroke.iterdir()):
+            if f.suffix in (".wav", ".txt"):
+                shutil.copy(f, dst / "stroke" / f.name); n_stroke += 1
+    print(f"笔顺片段 {n_stroke} 个" + ("" if n_stroke else "（没有 out/stroke，先跑 gen_stroke.py；不跑也能用，只是刷屏时不念笔顺）"))
 
     cfg = dst / "config.txt"
     if not cfg.exists():

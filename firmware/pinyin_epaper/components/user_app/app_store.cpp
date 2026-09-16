@@ -15,8 +15,10 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 
@@ -46,12 +48,14 @@ static int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v;
 
 void app_store_load_config(const char *path, app_config_t *c)
 {
-    c->volume            = 80;
-    c->wake_high         = false;
+    c->volume            = 100;   /* 周围吵的时候 80 听不清提示音，config.txt 里可以调小 */
+    c->wake_high         = true;
     c->mn_threshold      = 0.0f;
     c->listen_seconds    = 6;
     c->follow_up_seconds = 6;
     c->sleep_minutes     = 10;
+    c->stroke_order      = true;
+    c->stroke_gap_ms     = 0;     /* 自动：每个字按自己的笔画数摊，念完刚好赶上刷屏 */
 
     FILE *f = fopen(path, "r");
     if (!f) {
@@ -81,6 +85,8 @@ void app_store_load_config(const char *path, app_config_t *c)
             else if (!strcmp(k, "listen_seconds"))    c->listen_seconds    = clampi(atoi(v), 2, 30);
             else if (!strcmp(k, "follow_up_seconds")) c->follow_up_seconds = clampi(atoi(v), 0, 30);
             else if (!strcmp(k, "sleep_minutes"))     c->sleep_minutes     = clampi(atoi(v), 0, 240);
+            else if (!strcmp(k, "stroke_order"))      c->stroke_order      = !strcasecmp(v, "on");
+            else if (!strcmp(k, "stroke_gap_ms"))     c->stroke_gap_ms     = clampi(atoi(v), 0, 3000);
             else ESP_LOGW(TAG, "config.txt 不认识的配置项: %s", k);
         }
         fclose(f);
@@ -88,6 +94,9 @@ void app_store_load_config(const char *path, app_config_t *c)
     ESP_LOGI(TAG, "配置: 音量 %d  唤醒 %s  命令阈值 %.2f  等命令 %ds  连续对话 %ds  自动关机 %d 分钟",
              c->volume, c->wake_high ? "high" : "normal", c->mn_threshold,
              c->listen_seconds, c->follow_up_seconds, c->sleep_minutes);
+    ESP_LOGI(TAG, "      念笔顺 %s  笔画停顿 %s",
+             c->stroke_order ? "开" : "关",
+             c->stroke_gap_ms ? "固定" : "自动");
 }
 
 /* ---------- NVS ---------- */
@@ -223,7 +232,7 @@ int app_groups_find(const char *name)
     return -1;
 }
 
-/* 调试用：查某个字 / 说法在第几组 —— 跳字命令只注册当前组，别的组的字说了不会有反应 */
+/* 调试用：查某个字 / 说法在哪个清单里（直接读 SD 上的文件，看的是文件原样）*/
 void app_groups_grep(const char *query)
 {
     static char line[256];                 /* 在控制台任务里跑，栈小，放静态区 */
@@ -233,13 +242,13 @@ void app_groups_grep(const char *query)
         snprintf(path, sizeof(path), "%s/%s", s_group_dir, s_groups[g]);
         FILE *f = fopen(path, "r");
         if (!f) continue;
-        int idx = 0;                       /* 与 scope_load 一样跳过注释和空行，对上 c N */
+        int idx = 0;                       /* 与 scope_load 一样跳过注释和空行 */
         while (fgets(line, sizeof(line), f)) {
             line[strcspn(line, "\r\n")] = '\0';
             if (line[0] == '#' || line[0] == '\0') continue;
             if (strstr(line, query)) {
                 for (char *t = line; *t; t++) if (*t == '\t') *t = ' ';
-                ESP_LOGI(TAG, "第 %d 组 %s  c %d: %s", g + 1, s_groups[g], idx, line);
+                ESP_LOGI(TAG, "第 %d 组 %s 第 %d 个: %s", g + 1, s_groups[g], idx + 1, line);
                 hits++;
             }
             idx++;
@@ -251,12 +260,12 @@ void app_groups_grep(const char *query)
 
 /* ---------- 清单解析 ---------- */
 
-scope_t *scope_new(int cap)
+static scope_t *scope_alloc(int cap, size_t buf_cap)
 {
     scope_t *s = (scope_t *)heap_caps_calloc(1, sizeof(scope_t), MALLOC_CAP_SPIRAM);
     if (!s) return NULL;
     s->cap     = cap;
-    s->buf_cap = (size_t)cap * 48 + 4096;
+    s->buf_cap = buf_cap;
     s->ids     = (int *)heap_caps_calloc(cap, sizeof(int), MALLOC_CAP_SPIRAM);
     s->chars   = (const char **)heap_caps_calloc(cap, sizeof(char *), MALLOC_CAP_SPIRAM);
     s->phrases = (const char **)heap_caps_calloc(cap, sizeof(char *), MALLOC_CAP_SPIRAM);
@@ -264,6 +273,9 @@ scope_t *scope_new(int cap)
     if (!s->ids || !s->chars || !s->phrases || !s->buf) { scope_free(s); return NULL; }
     return s;
 }
+
+/* 一行约 100 字节（每字 6 种说法），按 128 留 */
+scope_t *scope_new(int cap) { return scope_alloc(cap, (size_t)cap * 128 + 4096); }
 
 void scope_free(scope_t *s)
 {
@@ -273,24 +285,13 @@ void scope_free(scope_t *s)
 }
 
 /* 格式（gen_scopes.py 生成，家长也可手写）: <字id>\t<汉字>\t<说法,备选说法>
- * 整个文件读进 buf 后原地切分，chars / phrases 直接指向 buf。*/
-bool scope_load(scope_t *s, const char *dir, const char *name, int total)
+ * 把 p 里的行追加到 s，原地切分，chars / phrases 直接指向 p。
+ * group_of 不为空时（查字表）跳过前面的组里已有的字，并记下字在第 g 组。
+ * 返回没解析的部分（s 装满了才会剩），*bad / *dup 累加格式不对的行 / 重复的字 */
+static char *parse_into(scope_t *s, char *p, int total, int16_t *group_of, int g, int *bad, int *dup)
 {
-    char path[160];
-    snprintf(path, sizeof(path), "%s/%s", dir, name);
-    FILE *f = fopen(path, "rb");
-    if (!f) { ESP_LOGE(TAG, "打不开清单: %s", path); return false; }
-    size_t len = fread(s->buf, 1, s->buf_cap - 1, f);
-    bool truncated = (len == s->buf_cap - 1) && fgetc(f) != EOF;
-    fclose(f);
-    s->buf[len] = '\0';
-    strncpy(s->name, name, sizeof(s->name) - 1);
-    s->name[sizeof(s->name) - 1] = '\0';
-
-    char *p = s->buf;
     if ((uint8_t)p[0] == 0xEF && (uint8_t)p[1] == 0xBB && (uint8_t)p[2] == 0xBF) p += 3;
-    int n = 0, bad = 0;
-    while (*p && n < s->cap) {
+    while (*p && s->n < s->cap) {
         char *line = p;
         char *nl = strchr(p, '\n');
         if (nl) { *nl = '\0'; p = nl + 1; } else { p += strlen(p); }
@@ -306,19 +307,99 @@ bool scope_load(scope_t *s, const char *dir, const char *name, int total)
 
         char *end;
         long id = strtol(line, &end, 10);
-        if (end == line || id < 0 || id >= total || id >= STORE_MAX_IDS) { bad++; continue; }
-        s->ids[n] = (int)id;
-        s->chars[n] = ch;
-        s->phrases[n] = phr;
-        n++;
+        if (end == line || id < 0 || id >= total || id >= STORE_MAX_IDS) { (*bad)++; continue; }
+        if (group_of) {
+            if (group_of[id] >= 0) { (*dup)++; continue; }
+            group_of[id] = (int16_t)g;
+        }
+        s->ids[s->n]     = (int)id;
+        s->chars[s->n]   = ch;
+        s->phrases[s->n] = phr;
+        s->n++;
     }
-    s->n = n;
-    if (truncated || *p) ESP_LOGW(TAG, "清单 %s 太长，只用了前 %d 字", name, n);
-    if (bad)             ESP_LOGW(TAG, "清单 %s 有 %d 行格式不对或字 id 越界，已跳过", name, bad);
-    return n > 0;
+    return p;
 }
 
-/* 没有任何清单时的兜底：按字表顺序学全部字（没有跳字命令）*/
+/* 整个文件读进 buf 后原地切分 */
+bool scope_load(scope_t *s, const char *dir, const char *name, int total)
+{
+    char path[160];
+    snprintf(path, sizeof(path), "%s/%s", dir, name);
+    FILE *f = fopen(path, "rb");
+    if (!f) { ESP_LOGE(TAG, "打不开清单: %s", path); return false; }
+    size_t len = fread(s->buf, 1, s->buf_cap - 1, f);
+    bool truncated = (len == s->buf_cap - 1) && fgetc(f) != EOF;
+    fclose(f);
+    s->buf[len] = '\0';
+    strncpy(s->name, name, sizeof(s->name) - 1);
+    s->name[sizeof(s->name) - 1] = '\0';
+
+    int bad = 0;
+    s->n = 0;
+    char *rest = parse_into(s, s->buf, total, NULL, 0, &bad, NULL);
+    if (truncated || *rest) ESP_LOGW(TAG, "清单 %s 太长，只用了前 %d 字", name, s->n);
+    if (bad)                ESP_LOGW(TAG, "清单 %s 有 %d 行格式不对或字 id 越界，已跳过", name, bad);
+    return s->n > 0;
+}
+
+/* ---------- 查字表 ---------- */
+
+static scope_t *s_all      = NULL;
+static int16_t *s_group_of = NULL;    /* 字 id → 在第几组（从 0 起），-1 = 不在清单里 */
+
+scope_t *app_groups_load_all(int total)
+{
+    if (s_all || s_group_n == 0) return s_all;
+    int64_t t0 = esp_timer_get_time();
+    char path[160];
+    size_t bytes = 0;                                  /* 所有清单一起读进一块内存 */
+    for (int g = 0; g < s_group_n; g++) {
+        struct stat st;
+        snprintf(path, sizeof(path), "%s/%s", s_group_dir, s_groups[g]);
+        if (stat(path, &st) == 0) bytes += st.st_size + 1;
+    }
+    s_group_of = (int16_t *)heap_caps_malloc(STORE_MAX_IDS * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    s_all = s_group_of ? scope_alloc(total, bytes + 1) : NULL;
+    if (!s_all) {
+        ESP_LOGE(TAG, "查字表要 %u 字节，内存不够", (unsigned)bytes);
+        free(s_group_of);
+        s_group_of = NULL;
+        return NULL;
+    }
+    memset(s_group_of, 0xff, STORE_MAX_IDS * sizeof(int16_t));
+
+    size_t off = 0;
+    int bad = 0, dup = 0;
+    for (int g = 0; g < s_group_n && s_all->buf_cap - off >= 2; g++) {
+        snprintf(path, sizeof(path), "%s/%s", s_group_dir, s_groups[g]);
+        FILE *f = fopen(path, "rb");
+        if (!f) { ESP_LOGW(TAG, "打不开清单: %s", path); continue; }
+        size_t len = fread(s_all->buf + off, 1, s_all->buf_cap - off - 1, f);
+        fclose(f);
+        s_all->buf[off + len] = '\0';
+        parse_into(s_all, s_all->buf + off, total, s_group_of, g, &bad, &dup);
+        off += len + 1;
+    }
+    ESP_LOGI(TAG, "查字表: %d 组共 %d 字（%u 字节），耗时 %d ms", s_group_n, s_all->n, (unsigned)off,
+             (int)((esp_timer_get_time() - t0) / 1000));
+    if (dup) ESP_LOGW(TAG, "%d 个字在多个清单里都有，查字时本组没有就去它第一次出现的组", dup);
+    if (bad) ESP_LOGW(TAG, "清单里有 %d 行格式不对或字 id 越界，已跳过", bad);
+    return s_all;
+}
+
+int app_groups_of(int id)
+{
+    return (s_group_of && id >= 0 && id < STORE_MAX_IDS) ? s_group_of[id] : -1;
+}
+
+int app_groups_char_id(const char *ch)
+{
+    for (int i = 0; s_all && i < s_all->n; i++)
+        if (strcmp(s_all->chars[i], ch) == 0) return s_all->ids[i];
+    return -1;
+}
+
+/* 没有任何清单时的兜底：按字表顺序学全部字（没有查字说法，不能查字）*/
 void scope_fill_all(scope_t *s, int total)
 {
     s->name[0] = '\0';
