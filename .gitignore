@@ -7,7 +7,8 @@ content/data/hanzi-chars/
 content/data/hanzi-words/
 content/data/hanzi-data/
 content/fonts/*.ttf
-content/graphics.txt        # makemeahanzi 笔画轮廓，30 MB，gen_anim.py 用；从 raw.githubusercontent.com 重下
+# makemeahanzi 笔画轮廓，30 MB，gen_anim.py 用；从 raw.githubusercontent.com 重下
+content/graphics.txt
 
 # 官方例程（vendor，可重新 clone）
 vendor/
