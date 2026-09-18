@@ -15,3 +15,7 @@ dependencies:
   #   # All dependencies of `main` are public by default.
   #   public: true
   espressif/esp-sr: "^2.0.0"
+  # AMOLED 板的屏和触摸。墨水屏板不用，但组件管理器不认编译期开关，
+  # 只能两块板都拉下来 —— 不引用就不会链进固件，只是多占点下载。
+  espressif/esp_lcd_co5300: "^2.0.3"
+  espressif/esp_lcd_touch_cst816s: "^1.1.1"

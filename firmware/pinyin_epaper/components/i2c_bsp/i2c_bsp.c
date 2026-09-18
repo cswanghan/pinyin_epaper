@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include "i2c_bsp.h"
 #include "freertos/FreeRTOS.h"
+#include "esp_log.h"
 #include "user_config.h"
 
 static i2c_master_bus_handle_t user_i2c_handle = NULL;
@@ -31,6 +32,47 @@ void i2c_master_Init(void)
 
   		dev_cfg.device_address = I2C_SHTC3_DEV_Address;
   	ESP_ERROR_CHECK(i2c_master_bus_add_device(user_i2c_handle, &dev_cfg, &shtc3_handle));
+}
+
+/* 扫总线。换板子时不知道挂了哪些芯片、地址对不对，靠这个一眼看完。*/
+void i2c_bus_scan(void)
+{
+  	char line[256]; int n = 0;
+  	n += snprintf(line + n, sizeof(line) - n, "I2C 扫描:");
+  	for (uint8_t a = 0x08; a < 0x78; a++) {
+  	  	if (i2c_master_probe(user_i2c_handle, a, 50) == ESP_OK)
+  	  	  	n += snprintf(line + n, sizeof(line) - n, " 0x%02X", a);
+  	}
+  	ESP_LOGI("I2C", "%s", line);
+}
+
+/* 临时挂一个从设备写一个寄存器，写完摘掉。和 i2c_peek 配对。*/
+int i2c_poke(uint8_t dev_addr, uint8_t reg, uint8_t val)
+{
+  	i2c_device_config_t cfg = {};
+  	  	cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+  	  	cfg.device_address  = dev_addr;
+  	  	cfg.scl_speed_hz    = 100000;
+  	i2c_master_dev_handle_t dev = NULL;
+  	if (i2c_master_bus_add_device(user_i2c_handle, &cfg, &dev) != ESP_OK) return -1;
+  	uint8_t pkt[2] = { reg, val };
+  	int ret = i2c_master_transmit(dev, pkt, 2, pdMS_TO_TICKS(200));
+  	i2c_master_bus_rm_device(dev);
+  	return ret;
+}
+
+/* 临时挂一个从设备读几个寄存器，读完摘掉。查外设状态用，不常驻。*/
+int i2c_peek(uint8_t dev_addr, uint8_t reg, uint8_t *buf, uint8_t len)
+{
+  	i2c_device_config_t cfg = {};
+  	  	cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+  	  	cfg.device_address  = dev_addr;
+  	  	cfg.scl_speed_hz    = 100000;
+  	i2c_master_dev_handle_t dev = NULL;
+  	if (i2c_master_bus_add_device(user_i2c_handle, &cfg, &dev) != ESP_OK) return -1;
+  	int ret = i2c_master_transmit_receive(dev, &reg, 1, buf, len, pdMS_TO_TICKS(200));
+  	i2c_master_bus_rm_device(dev);
+  	return ret;
 }
 
 int i2c_write_buff(i2c_master_dev_handle_t dev_handle,int reg,uint8_t *buf,uint8_t len)

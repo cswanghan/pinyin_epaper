@@ -16,6 +16,8 @@ idf_component_register(
   REQUIRES
   epaper_src
   epaper_port
+  amoled_port
+  touch_bsp
   led_bsp
   sdcard_bsp
   INCLUDE_DIRS ".")

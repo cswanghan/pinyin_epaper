@@ -1,4 +1,5 @@
 #include "sdcard_bsp.h"
+#include "user_config.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_vfs_fat.h"
@@ -11,9 +12,7 @@
 
 static const char *TAG = "_sdcard";
 
-#define SDMMC_D0_PIN    40  
-#define SDMMC_CLK_PIN   39
-#define SDMMC_CMD_PIN   41
+/*SDMMC_D0_PIN / SDMMC_CLK_PIN / SDMMC_CMD_PIN 现在由 user_config.h 按板子给出*/
 
 #define SDlist "/sdcard" 
 

@@ -11,6 +11,9 @@ extern "C" {
 #endif
 
 void i2c_master_Init(void);
+void i2c_bus_scan(void);
+int  i2c_peek(uint8_t dev_addr, uint8_t reg, uint8_t *buf, uint8_t len);
+int  i2c_poke(uint8_t dev_addr, uint8_t reg, uint8_t val);
 int i2c_write_buff(i2c_master_dev_handle_t dev_handle,int reg,uint8_t *buf,uint8_t len);
 int i2c_master_write_read_dev(i2c_master_dev_handle_t dev_handle,uint8_t *writeBuf,uint8_t writeLen,uint8_t *readBuf,uint8_t readLen);
 int i2c_read_buff(i2c_master_dev_handle_t dev_handle,int reg,uint8_t *buf,uint8_t len);

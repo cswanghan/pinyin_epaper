@@ -27,6 +27,18 @@ bool app_stroke_init(const char *sd_root, int total);
  * 返回预计念完要多少毫秒，0 = 这个字没有笔顺数据 */
 int app_stroke_speak(int id, int gap_ms);
 
+/* 逐画回调 —— 彩屏上一边念一边把笔画写出来时用。
+ * 在这一画的名字**真正开始响**的那一刻被调到（不是排进队列的那一刻）：
+ * app_stroke 会先等音频队列放空，再排这一条，然后调它。
+ * 回调该在 dur_ms 毫秒里把第 idx 画画完再返回；返回 false = 中断（来新字了），
+ * 剩下的笔画不再念。idx 从 0 数；短字念两遍时 idx 会从头再来一轮。*/
+typedef bool (*app_stroke_step_t)(int idx, int n, int dur_ms, void *ctx);
+
+/* 带逐画回调的版本。step 传 NULL 就完全等同 app_stroke_speak。
+ * 注意传了 step 就会阻塞到念完为止（要在这段时间里画动画），调用方自己负责
+ * 在回调里检查有没有新字进来。*/
+int app_stroke_speak_ex(int id, int gap_ms, app_stroke_step_t step, void *ctx);
+
 /* 笔画数；-1 = 没有笔顺数据（调试控制台用）*/
 int app_stroke_count(int id);
 

@@ -5,7 +5,9 @@
 目标结构:
   <SD>/pinyin/index.txt        生字总数
   <SD>/pinyin/chars.json       元数据（固件暂不读，便于排查）
-  <SD>/pinyin/img/0000.bin     墨水屏图，10000 字节
+  <SD>/pinyin/img/0000.bin     墨水屏图，200x200 四色，10000 字节
+  <SD>/pinyin/img565/0000.bin  AMOLED 图，368x448 RGB565 大端，329728 字节（约 786 MB）
+  <SD>/pinyin/anim/0000.bin    笔顺动画（只 AMOLED 用），PSA1 格式，5~35 KB 不等（约 62 MB）
   <SD>/pinyin/aud/0000_c.wav   字音
   <SD>/pinyin/aud/0000_w.wav   词组
   <SD>/pinyin/scope/*.txt      学习清单（一组一个文件）
@@ -24,6 +26,9 @@ os.environ["COPYFILE_DISABLE"] = "1"
 
 BASE = Path(__file__).parent
 SRC_IMG = BASE / "out/img"
+SRC_IMG565 = BASE / "out/img565"        # AMOLED 板的图，没生成就跳过
+IMG565_BYTES = 368 * 448 * 2            # 329728
+SRC_ANIM = BASE / "out/anim"            # AMOLED 板的笔顺动画，没生成就跳过
 SRC_AUD = BASE / "out/aud"
 CHARS   = BASE / "out/chars.json"
 
@@ -77,6 +82,54 @@ def main():
                 shutil.copy(a, dst / "aud" / a.name); n_aud += 1
             elif kind == "c" or r["words"]:
                 missing_aud.append(a.name)
+
+    # AMOLED 彩屏图。一张卡要同时喂两块板子，所以和墨水屏的 img/ 并排放，互不覆盖。
+    # 786 MB 拷一次要好几分钟，已经在卡上且大小对的就跳过，重跑不用重来。
+    n565 = skip565 = 0
+    if SRC_IMG565.exists():
+        d565 = dst / "img565"
+        d565.mkdir(exist_ok=True)
+        for r in recs:
+            src = SRC_IMG565 / f"{r['id']:04d}.bin"
+            if not (src.exists() and src.stat().st_size == IMG565_BYTES):
+                continue
+            tgt = d565 / src.name
+            if tgt.exists() and tgt.stat().st_size == IMG565_BYTES:
+                skip565 += 1
+                continue
+            shutil.copy(src, tgt); n565 += 1
+            if n565 % 200 == 0:
+                print(f"  彩屏图 {n565} 张…", flush=True)
+        # COPYFILE_DISABLE 挡得住 cp/tar，挡不住 shutil 走的 fcopyfile —— 它会把
+        # macOS 给新文件加的扩展属性一起拷过去，在 FAT 上就落成 2500 个 ._xxx 附属文件。
+        # 实测确实会出现，所以拷完统一清一遍。
+        junk = 0
+        for f in d565.glob("._*"):
+            f.unlink(); junk += 1
+        print(f"彩屏图 {n565 + skip565}/{len(recs)} 张（新拷 {n565}，已存在 {skip565}）"
+              + (f"，清掉 {junk} 个 ._ 附属文件" if junk else ""))
+
+    # 笔顺动画（只有 AMOLED 板用）。大小不固定，用「非空且和源一样大」当已拷过的判据
+    na = skipa = 0
+    if SRC_ANIM.exists():
+        da = dst / "anim"
+        da.mkdir(exist_ok=True)
+        for r in recs:
+            src = SRC_ANIM / f"{r['id']:04d}.bin"
+            if not src.exists():
+                continue
+            tgt = da / src.name
+            if tgt.exists() and tgt.stat().st_size == src.stat().st_size:
+                skipa += 1
+                continue
+            shutil.copy(src, tgt); na += 1
+            if na % 400 == 0:
+                print(f"  笔顺动画 {na} 份…", flush=True)
+        junk = 0                      # 同上，shutil 在 FAT 上会留 ._ 附属文件
+        for f in da.glob("._*"):
+            f.unlink(); junk += 1
+        print(f"笔顺动画 {na + skipa}/{len(recs)} 份（新拷 {na}，已存在 {skipa}）"
+              + (f"，清掉 {junk} 个 ._ 附属文件" if junk else ""))
 
     # 学习清单（语音跳转的命令词来源，家长也可自行增删）
     src_scope = BASE / "out/scope"

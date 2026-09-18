@@ -1,10 +1,15 @@
 /*****************************************************************************
  * 电源实现
  *
- * 引脚（见 main/user_config.h）:
+ * 墨水屏板（BOARD_HAS_GPIO_POWER=1）的引脚（见 main/user_config.h）:
  *   GPIO17 VBAT 自锁（高 = 保持供电）   GPIO6 屏幕电源（低 = 开）
  *   GPIO42 音频电源（低 = 开）          GPIO18 PWR 键（低 = 按下）
  *   GPIO4  电池电压 ADC（板上 1:1 分压，实际电压 = 读数 × 2）
+ *
+ * AMOLED 板上这套全都不成立：电源归 AXP2101 管（I2C），PWR 键接在 AXP2101 的
+ * PKEY 脚上，GPIO4/GPIO6 是屏幕 QSPI 的数据线 —— 碰一下就把屏总线拉坏。
+ * 所以整块按 BOARD_HAS_GPIO_POWER 编译期切掉，包括那个静态对象：
+ * 它的构造函数在 app_main 之前就跑，运行时判断根本来不及。
  *****************************************************************************/
 #include <stdio.h>
 #include "freertos/FreeRTOS.h"
@@ -14,19 +19,30 @@
 #include "driver/gpio.h"
 #include "driver/rtc_io.h"
 #include "driver/usb_serial_jtag.h"
+
+#include "app_power.h"
+#include "user_config.h"
+
+#if BOARD_HAS_GPIO_POWER
+#include "board_power_bsp.h"
+#endif
+
+#if BOARD_HAS_BAT_ADC
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
-
-#include "app_power.h"
-#include "board_power_bsp.h"
-#include "user_config.h"
+#endif
 
 #define TAG "POWER"
-#define BAT_ADC_PIN  GPIO_NUM_4
 
+#if BOARD_HAS_GPIO_POWER
 /* 构造函数在静态初始化时就把 VBAT 自锁拉高（见 board_power_bsp.cpp）*/
 static board_power_bsp_t s_board(EPD_PWR_PIN, Audio_PWR_PIN, VBAT_PWR_PIN);
+#endif
+
+#if BOARD_HAS_BAT_ADC
+
+#define BAT_ADC_PIN  GPIO_NUM_4
 
 static adc_oneshot_unit_handle_t s_adc  = NULL;
 static adc_cali_handle_t         s_cali = NULL;
@@ -64,12 +80,21 @@ int app_power_vbat_mv(void)
     return ok ? (sum / ok) * 2 : -1;
 }
 
+#else  /* 电量要从 AXP2101 读，P1 再做 */
+
+static void adc_init(void) {}
+int app_power_vbat_mv(void) { return -1; }
+
+#endif
+
 void app_power_init(void)
 {
+#if BOARD_HAS_GPIO_POWER
     s_board.VBAT_POWER_ON();
     s_board.POWEER_EPD_ON();
     s_board.POWEER_Audio_ON();
     vTaskDelay(pdMS_TO_TICKS(10));
+#endif
 
     esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
     if (cause != ESP_SLEEP_WAKEUP_UNDEFINED)
@@ -81,10 +106,16 @@ void app_power_init(void)
 }
 
 bool app_power_usb_connected(void) { return usb_serial_jtag_is_connected(); }
-bool app_power_key_down(void)      { return gpio_get_level(PWR_BUTTON_PIN) == 0; }
+
+#if BOARD_HAS_PWR_BUTTON
+bool app_power_key_down(void) { return gpio_get_level(PWR_BUTTON_PIN) == 0; }
+#else
+bool app_power_key_down(void) { return false; }
+#endif
 
 void app_power_off(void)
 {
+#if BOARD_HAS_GPIO_POWER
     /* 等松开 PWR 键：按着的时候键本身就接通电源，断自锁也关不掉 */
     for (int i = 0; i < 250 && app_power_key_down(); i++) vTaskDelay(pdMS_TO_TICKS(20));
 
@@ -103,4 +134,9 @@ void app_power_off(void)
     esp_sleep_enable_ext1_wakeup(1ULL << PWR_BUTTON_PIN, ESP_EXT1_WAKEUP_ANY_LOW);
     vTaskDelay(pdMS_TO_TICKS(50));                                     /* 让日志发完 */
     esp_deep_sleep_start();
+#else
+    /* AMOLED 板：关机得写 AXP2101 的关断寄存器，唤醒也得靠它的 PKEY 中断。
+     * P0 阶段还没接 PMU，这里不睡 —— 真睡下去没有唤醒源，只能按复位键。*/
+    ESP_LOGW(TAG, "这块板的关机要走 AXP2101（P1 再做），本次忽略");
+#endif
 }

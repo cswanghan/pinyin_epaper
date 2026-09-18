@@ -567,6 +567,63 @@ int app_sr_lookup_text(const char *text)
     return cmd;
 }
 
+/* 诊断开关：把左右两路的峰值都打出来。板载麦克风到底落在哪个声道、
+ * 电平够不够，靠耳朵和 VAD 的单一数字都看不出来 —— VAD 只报我们喂进去的那一路。
+ * 换板子/换麦克风时打开，平时置 0。*/
+#define SR_MIC_PROBE  0
+#define MIC_PROBE_MS  2000
+
+/* 增益扫描：每隔几秒换一档 PGA，把各档的底噪/峰值排出来看。
+ * 靠单一档位的数字判断不了「增益偏高」，得有对比。查完置 0。*/
+#define SR_GAIN_SWEEP   0
+#define SWEEP_STEP_MS   6000
+
+#if SR_MIC_PROBE
+/* 把一段原始采样按 base64 吐到串口，Mac 上还原成 wav 看波形和频谱。
+ * 峰值数字分不清「底噪」和「破掉的人声」，波形能。
+ * 注意：吐的时候 feed 会卡住，AFE 会丢帧 —— 只在查麦克风时用。*/
+#define DUMP_SAMPLES  16000        /* 1 秒 @16k */
+#define DUMP_TIMES    0            /* 要抓原始波形时改成 3 */
+#define DUMP_FIRST_S  8
+#define DUMP_GAP_S    10
+
+/* 每行独立可解：`MD <行号> <384 字节的 base64>`。
+ * USB CDC 满了会丢字节，不带行号的话丢一点后面整段都错位、对不齐。*/
+#define DUMP_LINE_BYTES  384
+
+static void mic_dump(const int16_t *pcm, int n)
+{
+    static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const uint8_t *p = (const uint8_t *)pcm;
+    int bytes = n * 2;
+    int lines = (bytes + DUMP_LINE_BYTES - 1) / DUMP_LINE_BYTES;
+    char out[DUMP_LINE_BYTES / 3 * 4 + 1];
+
+    printf("\n<<<MICDUMP %d %d\n", bytes, lines);
+    fflush(stdout);
+    for (int ln = 0; ln < lines; ln++) {
+        int off = ln * DUMP_LINE_BYTES;
+        int len = bytes - off; if (len > DUMP_LINE_BYTES) len = DUMP_LINE_BYTES;
+        int o = 0;
+        for (int i = 0; i < len; i += 3) {
+            uint32_t v = p[off + i] << 16;
+            if (i + 1 < len) v |= p[off + i + 1] << 8;
+            if (i + 2 < len) v |= p[off + i + 2];
+            out[o++] = b64[(v >> 18) & 63];
+            out[o++] = b64[(v >> 12) & 63];
+            out[o++] = (i + 1 < len) ? b64[(v >> 6) & 63] : '=';
+            out[o++] = (i + 2 < len) ? b64[v & 63]        : '=';
+        }
+        out[o] = 0;
+        printf("MD %d %s\n", ln, out);
+        fflush(stdout);
+        if ((ln & 7) == 7) vTaskDelay(1);      /* 让 USB 把缓冲吐干净 */
+    }
+    printf(">>>MICDUMP\n");
+    fflush(stdout);
+}
+#endif
+
 /* ---------- feed 任务：麦克风 → AFE ---------- */
 static void feed_task(void *arg)
 {
@@ -578,8 +635,60 @@ static void feed_task(void *arg)
     assert(stereo && feed);
     ESP_LOGI(TAG, "feed 任务启动: chunk=%d feed_ch=%d", chunk, feed_ch);
 
+#if SR_MIC_PROBE
+    int pk_l = 0, pk_r = 0, probe_n = 0;
+    const int probe_max = MIC_PROBE_MS * 16 / chunk;      /* 16 采样/ms */
+    int64_t sq_l = 0;
+    int16_t *dump = DUMP_TIMES ? (int16_t *)heap_caps_malloc(DUMP_SAMPLES * 2, MALLOC_CAP_SPIRAM) : NULL;
+    int dump_n = 0, dump_done = 0;
+    int64_t dump_at = esp_timer_get_time() + (int64_t)DUMP_FIRST_S * 1000000;
+#if SR_GAIN_SWEEP
+    static const float sweep[] = { 42, 36, 30, 24, 18, 12 };
+    int sweep_i = -1;
+    int64_t sweep_at = esp_timer_get_time();
+#endif
+#endif
+
     for (;;) {
         audio_playback_read(stereo, chunk * 2 * sizeof(int16_t));
+#if SR_MIC_PROBE
+        if (!s_muted) {
+#if SR_GAIN_SWEEP
+            if (esp_timer_get_time() >= sweep_at &&
+                sweep_i + 1 < (int)(sizeof(sweep) / sizeof(sweep[0]))) {
+                sweep_i++;
+                audio_record_set_gain(sweep[sweep_i]);
+                ESP_LOGW(TAG, "== PGA 增益 → %.0f dB ==", sweep[sweep_i]);
+                sweep_at = esp_timer_get_time() + (int64_t)SWEEP_STEP_MS * 1000;
+                pk_l = pk_r = 0; sq_l = 0; probe_n = 0;      /* 换档后重新统计 */
+            }
+#endif
+            for (int i = 0; i < chunk; i++) {
+                int l = abs(stereo[i * 2]), r = abs(stereo[i * 2 + 1]);
+                if (l > pk_l) pk_l = l;
+                if (r > pk_r) pk_r = r;
+                sq_l += (int64_t)stereo[i * 2] * stereo[i * 2];
+            }
+            if (dump && dump_done < DUMP_TIMES && esp_timer_get_time() >= dump_at) {
+                for (int i = 0; i < chunk && dump_n < DUMP_SAMPLES; i++)
+                    dump[dump_n++] = stereo[i * 2];
+                if (dump_n >= DUMP_SAMPLES) {
+                    mic_dump(dump, dump_n);
+                    dump_n = 0;
+                    dump_done++;
+                    dump_at = esp_timer_get_time() + (int64_t)DUMP_GAP_S * 1000000;
+                }
+            }
+            if (++probe_n >= probe_max) {
+                double rms = sqrt((double)sq_l / ((double)probe_n * chunk));
+                ESP_LOGI(TAG, "mic: 左 底噪 %.0f dB 峰值 %.0f dB | 右 %s",
+                         20 * log10((rms > 1 ? rms : 1) / 32768.0),
+                         20 * log10((pk_l ? pk_l : 1) / 32768.0),
+                         pk_r ? "有信号" : "静默");
+                pk_l = pk_r = 0; sq_l = 0; probe_n = 0;
+            }
+        }
+#endif
         if (s_muted) {
             /* 朗读中：喂静音，既保持 AFE 时序又不会被喇叭声误触发 */
             memset(feed, 0, chunk * feed_ch * sizeof(int16_t));

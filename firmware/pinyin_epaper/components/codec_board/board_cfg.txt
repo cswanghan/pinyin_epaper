@@ -82,3 +82,9 @@ Board: S3_ePaper_1_54
 i2c: {sda: 47, scl: 48}
 i2s: {bclk: 15, ws: 38, dout: 45, din: 16, mclk: 14}
 in_out: {codec: ES8311, pa: 46, use_mclk: 1, pa_gain:6}
+
+Board: S3_AMOLED_1_8
+i2c: {sda: 15, scl: 14}
+i2s: {bclk: 9, ws: 45, dout: 8, din: 10, mclk: 16}
+in_out: {codec: ES8311, pa: 46, use_mclk: 1, pa_gain:6}
+sdcard: {clk: 2, cmd: 1, d0: 3}

@@ -7,6 +7,8 @@
 #include <sys/stat.h>
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include "app_stroke.h"
 #include "app_audio.h"
@@ -158,7 +160,19 @@ void app_stroke_set_window(int ms)
     s_measured  = true;
 }
 
+/* 等音频队列放空。带逐画回调时用来对时：队列空了，下一条排进去就是立刻开响，
+ * 回调拿到的「现在」才真是这一画开始念的时刻。20 秒封顶，免得哪里卡住就永远出不来。*/
+static void wait_audio_idle(void)
+{
+    for (int i = 0; i < 2000 && !app_audio_idle(); i++) vTaskDelay(pdMS_TO_TICKS(10));
+}
+
 int app_stroke_speak(int id, int gap_ms)
+{
+    return app_stroke_speak_ex(id, gap_ms, NULL, NULL);
+}
+
+int app_stroke_speak_ex(int id, int gap_ms, app_stroke_step_t step, void *ctx)
 {
     if (!s_ready || id < 0 || id >= s_total || !s_enc[id]) return 0;
     const char *enc = s_enc[id];
@@ -206,8 +220,16 @@ int app_stroke_speak(int id, int gap_ms)
         for (int i = 0; i < k; i++) {
             int c = dec(enc[i]);
             if (c < 0 || c >= CLIP_N) continue;
+            /* 有回调时先等干净再排，这样「排进去」和「开始响」是同一刻；
+             * 第一画等的是字音和词组，之后每画等的是上一画的停顿 */
+            if (step) wait_audio_idle();
             snprintf(p, sizeof(p), "%s/stroke/s%02d.wav", s_root, c);
             app_audio_play_file(p);
+            if (step && !step(i, k, s_dur_s[c], ctx)) {
+                /* 回调说要中断（来新字了）。已经排出去的那一条由 app_audio_stop 收拾 */
+                ESP_LOGI(TAG, "笔顺念到第 %d 画被打断", i + 1);
+                return 0;
+            }
             app_audio_gap(gap);
         }
     }
@@ -215,8 +237,13 @@ int app_stroke_speak(int id, int gap_ms)
     app_audio_play_file(p);
 
     int total_ms = body + gap * slots;
-    ESP_LOGI(TAG, "笔顺 %d 画%s 停顿 %d ms 念完约 %.1f 秒（刷屏窗口 %.1f 秒%s）",
-             k, twice ? "×2" : "", gap, total_ms / 1000.0, s_window_ms / 1000.0,
-             s_measured ? "实测" : "初值");
+    if (gap_ms > 0)
+        /* 固定停顿（config 指定，或者这块板没屏可等）—— 刷屏窗口没参与计算，别报出来误导 */
+        ESP_LOGI(TAG, "笔顺 %d 画%s 停顿 %d ms（固定）念完约 %.1f 秒",
+                 k, twice ? "×2" : "", gap, total_ms / 1000.0);
+    else
+        ESP_LOGI(TAG, "笔顺 %d 画%s 停顿 %d ms 念完约 %.1f 秒（刷屏窗口 %.1f 秒%s）",
+                 k, twice ? "×2" : "", gap, total_ms / 1000.0, s_window_ms / 1000.0,
+                 s_measured ? "实测" : "初值");
     return total_ms;
 }

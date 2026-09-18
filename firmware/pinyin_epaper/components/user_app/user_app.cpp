@@ -1,7 +1,10 @@
 /*****************************************************************************
  * 小学生字学习机 —— 主应用
  *
- * 硬件: Waveshare ESP32-S3-ePaper-1.54G (200x200 四色墨水屏 + ES8311 音频 + SD)
+ * 硬件: 由 main/user_config.h 的 APP_BOARD 选定
+ *   BOARD_EPAPER_1_54  Waveshare ESP32-S3-ePaper-1.54G (200x200 四色墨水屏 + ES8311 + SD)
+ *   BOARD_AMOLED_1_8   Waveshare ESP32-S3-Touch-AMOLED-1.8 (368x448 AMOLED + ES8311 + SD)
+ *                      P0 阶段只搬语音，屏还没接，display_task 退化成「只念笔顺」
  *
  * 任务划分:
  *   cmd_task      唯一持有学习状态（当前组 / 当前字 / 掌握标记）。语音、按键、
@@ -29,13 +32,25 @@
 #include "audio_bsp.h"
 #include "i2c_bsp.h"
 #include "sdcard_bsp.h"
+#if BOARD_HAS_EPAPER
 #include "epaper_port.h"
+#endif
+#if BOARD_HAS_AMOLED
+#include "amoled_port.h"
+/* 点亮验收开关。开机刷一张校验图，用来确认 RGB565 字节序、原点方向、X 偏移。
+ * 三样已于 2026-09-18 在实机确认无误，平时保持 0；改了送屏相关代码再临时打开。*/
+#define AMOLED_TEST_PATTERN  0
+#define AMOLED_BRIGHTNESS    80
+#endif
 #include "app_sr.h"
 #include "app_audio.h"
 #include "app_store.h"
 #include "app_stroke.h"
 #include "app_power.h"
 #include "app_console.h"
+#if BOARD_HAS_TOUCH
+#include "touch_bsp.h"
+#endif
 
 #define TAG "PINYIN"
 
@@ -76,7 +91,9 @@ static scope_t *s_lookup     = NULL;    /* 查字表 = 所有清单合起来，�
 static QueueHandle_t  s_cmd_q     = NULL;
 static QueueHandle_t  s_disp_q    = NULL;
 static volatile bool  s_disp_busy = false;
+#if BOARD_HAS_EPAPER
 static uint8_t       *s_epd_buf   = NULL;
+#endif
 
 static void post_cmd(int cmd)
 {
@@ -84,7 +101,23 @@ static void post_cmd(int cmd)
         ESP_LOGW(TAG, "命令队列满，丢弃 %d", cmd);
 }
 
+#if BOARD_HAS_TOUCH
+/* 触摸补的是按键的缺口：这块板没有 GPIO 上的 PWR 键。
+ * 轻点 = 单击 BOOT（唤醒语音），左右滑 = 翻字，和语音的「下一个/上一个」同一条命令。*/
+static void on_touch(touch_evt_t evt)
+{
+    switch (evt) {
+    case TOUCH_SWIPE_LEFT:  post_cmd(SR_CMD_NEXT); break;
+    case TOUCH_SWIPE_RIGHT: post_cmd(SR_CMD_PREV); break;
+    case TOUCH_TAP:
+    default:                post_cmd(APP_EVT_WAKE_KEY); break;
+    }
+}
+#endif
+
 /* ======================= 刷屏 ======================= */
+
+#if BOARD_HAS_EPAPER
 
 static void put_px(uint8_t *buf, int x, int y, uint8_t c)
 {
@@ -159,6 +192,316 @@ static void display_task(void *arg)
     }
 }
 
+#elif BOARD_HAS_AMOLED   /* ---------- 368x448 RGB565 彩屏 ---------- */
+
+/* SD 上的图就是整屏 RGB565 大端，直接 fread 进 PSRAM 再整块送屏，不做任何转换。
+ * 目录是 img565/ 不是 img/ —— 一张卡要同时喂墨水屏板和这块板，两套图并存。
+ * 生成脚本: content/gen_images_amoled.py */
+static uint16_t *s_fb = NULL;
+
+/* 已掌握的字在右上角画白勾（gen_images_amoled.py 的 MASTER_BOX 给它留了空）*/
+#define CHECK_X  316
+#define CHECK_Y  14
+
+static void px565(uint16_t *fb, int x, int y, uint16_t c)
+{
+    if (x < 0 || x >= AMOLED_W || y < 0 || y >= AMOLED_H) return;
+    fb[(size_t)y * AMOLED_W + x] = c;
+}
+
+static void thick_line565(uint16_t *fb, int x0, int y0, int x1, int y1, int r, uint16_t c)
+{
+    int dx = x1 - x0, dy = y1 - y0;
+    int steps = abs(dx) > abs(dy) ? abs(dx) : abs(dy);
+    for (int i = 0; i <= steps; i++) {
+        int x = x0 + dx * i / steps, y = y0 + dy * i / steps;
+        for (int oy = -r; oy <= r; oy++)
+            for (int ox = -r; ox <= r; ox++)
+                if (ox * ox + oy * oy <= r * r) px565(fb, x + ox, y + oy, c);
+    }
+}
+
+static void draw_check565(uint16_t *fb)
+{
+    /* 黑底上用亮绿，比红的显眼；40x40 的框里画一个对勾 */
+    uint16_t g = amoled_rgb(90, 220, 110);
+    thick_line565(fb, CHECK_X + 4,  CHECK_Y + 22, CHECK_X + 15, CHECK_Y + 33, 2, g);
+    thick_line565(fb, CHECK_X + 15, CHECK_Y + 33, CHECK_X + 36, CHECK_Y + 6,  2, g);
+}
+
+static bool load_image(int id)
+{
+    char path[64];
+    snprintf(path, sizeof(path), "%s/img565/%04d.bin", SD_ROOT, id);
+    FILE *f = fopen(path, "rb");
+    if (!f) { ESP_LOGE(TAG, "读图失败: %s", path); return false; }
+    size_t n = fread(s_fb, 1, AMOLED_FB_BYTES, f);
+    fclose(f);
+    if (n != AMOLED_FB_BYTES) {
+        ESP_LOGE(TAG, "图片尺寸异常 %s: %u 字节（应为 %d）", path, (unsigned)n, AMOLED_FB_BYTES);
+        return false;
+    }
+    return true;
+}
+
+/* ---------------- 米字格 ---------------- */
+/* 小学练字本那种米字格。位置和 content/gen_anim.py 的 BOX_* 是同一个框，改一边就要改另一边。
+ * 全量扫过 2500 张图，大字墨迹落在 y 115..320 / x 79..292，这个框四边都留了十几像素余量，
+ * 又够不着拼音（底边 y=80）和分隔线（y=344）。*/
+#define GRID_X  64
+#define GRID_Y  98
+#define GRID_S  240
+
+/* 只落在黑底上 —— 这样静态图和动画能共用一次调用，格线永远压在字底下 */
+static inline void grid_px(uint16_t *fb, int x, int y, uint16_t c)
+{
+    if (x < 0 || x >= AMOLED_W || y < 0 || y >= AMOLED_H) return;
+    size_t i = (size_t)y * AMOLED_W + x;
+    if (fb[i] == 0) fb[i] = c;
+}
+
+static void draw_grid565(uint16_t *fb)
+{
+    const uint16_t c = amoled_rgb(78, 26, 26);     /* 暗红：看得见，又不跟白字抢 */
+    const int x1 = GRID_X + GRID_S - 1, y1 = GRID_Y + GRID_S - 1;
+
+    for (int i = 0; i < GRID_S; i++) {            /* 外框实线 */
+        grid_px(fb, GRID_X + i, GRID_Y, c); grid_px(fb, GRID_X + i, y1, c);
+        grid_px(fb, GRID_X, GRID_Y + i, c); grid_px(fb, x1, GRID_Y + i, c);
+    }
+    /* 中线和对角线走虚线（练字本就是这么印的，也免得跟笔画混在一起）*/
+    const int cx = GRID_X + GRID_S / 2, cy = GRID_Y + GRID_S / 2;
+    for (int i = 0; i < GRID_S; i++) {
+        if ((i / 6) & 1) continue;                 /* 实 6 虚 6 */
+        grid_px(fb, GRID_X + i, cy, c);
+        grid_px(fb, cx, GRID_Y + i, c);
+        grid_px(fb, GRID_X + i, GRID_Y + i, c);
+        grid_px(fb, GRID_X + i, y1 - i, c);
+    }
+}
+
+/* ---------------- 笔顺动画 ---------------- */
+/* 数据是 content/gen_anim.py 生成的 anim/<id>.bin：整个字的墨点按笔画分好组、
+ * 组内按书写先后排好序，坐标是米字格框内的 (x,y)，一像素两字节。
+ *
+ * 关键：动画不自己画笔画，只是把静态图上那个字的像素按顺序放出来 ——
+ * 所以写完留在屏上的就是静态图本身，一个像素都不差，不会写完之后字形跳一下。*/
+#define ANIM_MAX_STROKES  32          /* 全量实测最多 23 画 */
+#define ANIM_MAX_BYTES    (48 * 1024) /* 全量实测最大 34850 字节 */
+#define ANIM_FRAME_MS     33          /* 约 30 fps；系统 tick 10 ms，实际落在 30/40 ms 一帧 */
+
+/* 正在写的那一笔的颜色 */
+#define HL_R 255
+#define HL_G 190
+#define HL_B 60
+
+static uint8_t  *s_anim_raw = NULL;   /* anim/<id>.bin 原文 */
+static uint16_t *s_glyph    = NULL;   /* 框内 240x240 的原始像素（从静态图上抠下来的）*/
+static int       s_anim_drawn = 0;    /* 已经写到第几画；念两遍时用来判断要不要擦了重来 */
+static struct {
+    uint8_t        n;
+    uint16_t       cnt[ANIM_MAX_STROKES];
+    const uint8_t *px[ANIM_MAX_STROKES];
+} s_anim;
+
+static bool load_anim(int id, int want_strokes)
+{
+    s_anim.n = 0;
+    if (!s_anim_raw || !s_glyph || want_strokes <= 0) return false;
+
+    char path[64];
+    snprintf(path, sizeof(path), "%s/anim/%04d.bin", SD_ROOT, id);
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;                          /* 没有就退回静态显示，不算错 */
+    size_t n = fread(s_anim_raw, 1, ANIM_MAX_BYTES, f);
+    fclose(f);
+
+    if (n < 12 || memcmp(s_anim_raw, "PSA1", 4) != 0) {
+        ESP_LOGW(TAG, "笔顺动画文件不认识: %s", path); return false;
+    }
+    uint8_t ns = s_anim_raw[4], w = s_anim_raw[5], h = s_anim_raw[6];
+    uint16_t x0, y0;
+    memcpy(&x0, s_anim_raw + 8, 2);                /* 文件是小端，和 S3 一致 */
+    memcpy(&y0, s_anim_raw + 10, 2);
+    if (w != GRID_S || h != GRID_S || x0 != GRID_X || y0 != GRID_Y) {
+        ESP_LOGW(TAG, "笔顺动画框对不上 %dx%d@%d,%d，固件要的是 %dx%d@%d,%d",
+                 w, h, x0, y0, GRID_S, GRID_S, GRID_X, GRID_Y);
+        return false;
+    }
+    if (ns == 0 || ns > ANIM_MAX_STROKES || ns != want_strokes) {
+        ESP_LOGW(TAG, "笔顺动画 %d 画，笔顺表 %d 画，对不上", ns, want_strokes);
+        return false;
+    }
+
+    size_t need = 12 + (size_t)ns * 2;
+    if (n < need) { ESP_LOGW(TAG, "笔顺动画文件截断"); return false; }
+    const uint8_t *p = s_anim_raw + need;
+    size_t total = 0;
+    for (int i = 0; i < ns; i++) {
+        uint16_t c; memcpy(&c, s_anim_raw + 12 + i * 2, 2);
+        s_anim.cnt[i] = c;
+        s_anim.px[i]  = p + total * 2;
+        total += c;
+    }
+    if (need + total * 2 != n) {
+        ESP_LOGW(TAG, "笔顺动画像素数对不上: 头说 %u，文件 %u 字节",
+                 (unsigned)(need + total * 2), (unsigned)n);
+        return false;
+    }
+    s_anim.n = ns;
+    return true;
+}
+
+static void save_glyph(const uint16_t *fb)
+{
+    for (int y = 0; y < GRID_S; y++)
+        memcpy(&s_glyph[(size_t)y * GRID_S],
+               &fb[(size_t)(GRID_Y + y) * AMOLED_W + GRID_X], GRID_S * 2);
+}
+
+static void blank_box(uint16_t *fb)
+{
+    for (int y = 0; y < GRID_S; y++)
+        memset(&fb[(size_t)(GRID_Y + y) * AMOLED_W + GRID_X], 0, GRID_S * 2);
+}
+
+/* 原像素是白字，亮度藏在任一通道里。按它重新配一遍暖黄，抗锯齿的灰边跟着淡下去，
+ * 边缘才不会毛 —— 一刀切填黄会把半透明的边描成硬边。*/
+static inline uint16_t tint565(uint16_t be)
+{
+    uint32_t a = (uint32_t)(((be >> 8) | (be << 8)) & 0xFFFF) >> 11;   /* 红通道 0..31 */
+    return amoled_rgb((uint8_t)(HL_R * a / 31), (uint8_t)(HL_G * a / 31), (uint8_t)(HL_B * a / 31));
+}
+
+/* 把第 idx 画的 [from,to) 个像素写进 s_fb，回填改动到的行范围（框内行号）*/
+static void put_px(int idx, uint32_t from, uint32_t to, bool hl, int *ylo, int *yhi)
+{
+    const uint8_t *p = s_anim.px[idx];
+    for (uint32_t i = from; i < to; i++) {
+        int x = p[i * 2], y = p[i * 2 + 1];
+        uint16_t src = s_glyph[(size_t)y * GRID_S + x];
+        s_fb[(size_t)(GRID_Y + y) * AMOLED_W + GRID_X + x] = hl ? tint565(src) : src;
+        if (y < *ylo) *ylo = y;
+        if (y > *yhi) *yhi = y;
+    }
+}
+
+/* 逐画回调 —— app_stroke 在这一画的名字开始响的那一刻调进来，
+ * 我们就在念这个名字的 dur_ms 里把这一笔写出来。*/
+static bool anim_step(int idx, int n, int dur_ms, void *ctx)
+{
+    (void)n;
+    if (idx < 0 || idx >= s_anim.n) return true;
+
+    if (idx == 0 && s_anim_drawn > 0) {           /* 短字念两遍：第二遍擦了重写 */
+        blank_box(s_fb);
+        draw_grid565(s_fb);
+        amoled_port_draw_rows(s_fb, GRID_Y, GRID_S);
+        s_anim_drawn = 0;
+    }
+
+    uint32_t cnt = s_anim.cnt[idx];
+    int frames = dur_ms / ANIM_FRAME_MS;
+    if (frames < 2)  frames = 2;
+    if (frames > 40) frames = 40;
+
+    int64_t t0 = esp_timer_get_time();
+    uint32_t done = 0;
+    for (int f = 1; f <= frames; f++) {
+        uint32_t upto = (uint32_t)((uint64_t)cnt * f / frames);
+        int ylo = GRID_S, yhi = -1;
+        put_px(idx, done, upto, true, &ylo, &yhi);
+        done = upto;
+        /* 只送真正改了的那几行：整屏 29 ms，几行 1~2 ms */
+        if (yhi >= 0) amoled_port_draw_rows(s_fb, GRID_Y + ylo, yhi - ylo + 1);
+
+        /* 来新字了就立刻收手，别让孩子等着看完错字的笔顺 */
+        if (uxQueueMessagesWaiting(s_disp_q) > 0) { *(bool *)ctx = false; return false; }
+
+        int wait = (int)((t0 + (int64_t)dur_ms * 1000 * f / frames - esp_timer_get_time()) / 1000);
+        if (wait > 0) vTaskDelay(pdMS_TO_TICKS(wait));
+    }
+
+    int ylo = GRID_S, yhi = -1;                   /* 这一画写完，从高亮转成正式的白 */
+    put_px(idx, 0, cnt, false, &ylo, &yhi);
+    if (yhi >= 0) amoled_port_draw_rows(s_fb, GRID_Y + ylo, yhi - ylo + 1);
+    s_anim_drawn = idx + 1;
+    return true;
+}
+
+/* 彩屏刷屏只要一百多毫秒，墨水屏那套「把笔顺停顿摊进 20 秒刷屏窗口」在这儿没有意义。
+ * 这块板换了个玩法：字不直接给，先只摆米字格，然后跟着笔画名一笔一笔写出来 ——
+ * 念「横」的时候横正在长，念完停 600 ms 让孩子跟着写一笔。*/
+#define STROKE_GAP_FAST_MS  600
+
+static void display_task(void *arg)
+{
+    int code;
+    for (;;) {
+        if (xQueueReceive(s_disp_q, &code, portMAX_DELAY) != pdTRUE) continue;
+        int id = code / 2;
+        if (code == app_store_get_shown()) {
+            ESP_LOGI(TAG, "id=%d 画面没变，跳过", id);
+        } else if (load_image(id)) {
+            if (code & 1) draw_check565(s_fb);
+            app_store_set_shown(-1);              /* 刷到一半断电 → 下次开机必刷 */
+
+            /* 要写笔顺就先把字收起来，屏上只留拼音、词组和空米字格 */
+            bool anim = s_cfg.stroke_order && load_anim(id, app_stroke_count(id));
+            if (anim) { save_glyph(s_fb); blank_box(s_fb); }
+            draw_grid565(s_fb);
+            s_anim_drawn = 0;
+
+            int64_t t0 = esp_timer_get_time();
+            amoled_port_draw(s_fb);
+            ESP_LOGI(TAG, "刷屏 id=%d%s %d ms%s", id, (code & 1) ? " ✓" : "",
+                     (int)((esp_timer_get_time() - t0) / 1000),
+                     anim ? " → 写笔顺" : "");
+
+            bool ok = true;
+            if (s_cfg.stroke_order)
+                app_stroke_speak_ex(id, s_cfg.stroke_gap_ms > 0 ? s_cfg.stroke_gap_ms
+                                                                : STROKE_GAP_FAST_MS,
+                                    anim ? anim_step : NULL, &ok);
+            /* 被插队打断时字只写了一半，别记成「屏上已经是这个字了」，
+             * 不然下次再查到它会判定画面没变、直接跳过 */
+            if (ok) app_store_set_shown(code);
+        }
+        if (uxQueueMessagesWaiting(s_disp_q) == 0) s_disp_busy = false;
+    }
+}
+
+#else  /* 两块屏都没有 —— P0 阶段的无屏版本 */
+
+/* 没有屏，但这个任务不能省：笔顺朗读是在 display_task 里发起的，不在 show() 里。
+ * 直接砍掉这个任务，笔顺就一声不响地没了 —— 而笔顺恰恰是 P0 要验证的东西之一。
+ * 所以保留整条链路（队列 → 任务 → app_stroke_speak），只把读图和刷面板摘掉。
+ *
+ * 少了那 20 秒窗口，停顿也没法再「摊」了：自动模式会按 20.5 秒的初值算，
+ * 每画之间能拉出一两秒的空。没屏的时候按固定节奏念就行。*/
+#define STROKE_GAP_NOSCREEN_MS  600
+
+static void display_task(void *arg)
+{
+    int code;
+    for (;;) {
+        if (xQueueReceive(s_disp_q, &code, portMAX_DELAY) != pdTRUE) continue;
+        int id = code / 2;
+        if (code == app_store_get_shown()) {
+            ESP_LOGI(TAG, "id=%d 画面没变，跳过", id);
+        } else {
+            ESP_LOGI(TAG, "（无屏）id=%d%s", id, (code & 1) ? " ✓" : "");
+            if (s_cfg.stroke_order)
+                app_stroke_speak(id, s_cfg.stroke_gap_ms > 0 ? s_cfg.stroke_gap_ms
+                                                             : STROKE_GAP_NOSCREEN_MS);
+            app_store_set_shown(code);
+        }
+        if (uxQueueMessagesWaiting(s_disp_q) == 0) s_disp_busy = false;
+    }
+}
+
+#endif /* 屏 */
+
 /* 排一次刷屏。画面本来就对（开机恢复上次的字、重复按同一个字）就不刷 ——
  * 不刷就没有那 17.6 秒的空档，display_task 也就不会念笔顺 */
 static void request_display(int id)
@@ -171,7 +514,11 @@ static void request_display(int id)
          * 笔顺朗读和再喊一遍，不是那 17.6 秒。字音和词组已经排在前面了，孩子知道听见了，
          * 再补一句「等一下哦」，免得后面这十几秒静音显得像死机 */
         ESP_LOGI(TAG, "正在刷屏，id=%d 排队，刷完接着上", id);
+#if BOARD_HAS_EPAPER
+        /* 彩屏刷一张一百多毫秒，s_disp_busy 几乎不可能被撞上；真撞上了也没有十几秒
+         * 的静音要解释，一句「等一下哦」反而多余。这句提示只给墨水屏 */
         app_audio_prompt("busy", TONE_BUSY);
+#endif
     }
     s_disp_busy = true;
     xQueueOverwrite(s_disp_q, &code);
@@ -336,7 +683,9 @@ static void power_off(const char *why)
      * s_disp_busy 要跨两次刷屏（17.6×2 = 35.2 秒）才落下，上限给到 40 秒 */
     for (int i = 0; i < 400 && s_disp_busy; i++) vTaskDelay(pdMS_TO_TICKS(100));
     if (s_dirty) export_progress();
+#if BOARD_HAS_EPAPER
     epaper_port_sleep();
+#endif
     app_power_off();
 }
 
@@ -527,13 +876,44 @@ static void restore_position(void)
         if (s_scope->ids[i] == id) { s_pos = i; break; }
 }
 
+
 void user_app_init(void)
 {
     ESP_LOGI(TAG, "===== 小学生字学习机启动 =====");
+
+#if BOARD_HAS_AMOLED
+    /* I2C 得在屏之前起来 —— 屏的供电和复位挂在 TCAL9534(0x20) 上，走的就是这条总线。
+     * I2C 在 15/14，和屏的 QSPI（4/5/6/7/11/12）不冲突。*/
+    i2c_master_Init();
+    i2c_bus_scan();
+
+    if (amoled_port_init()) {
+        amoled_port_brightness(AMOLED_BRIGHTNESS);
+#if AMOLED_TEST_PATTERN
+        amoled_port_test_pattern();
+#endif
+    }
+
+#endif
+
+#if BOARD_HAS_TOUCH
+    /* 必须排在 amoled_port_init() 之后 —— 触摸的复位脚和屏一样挂在 TCAL9534 上 */
+    touch_bsp_init(on_touch);
+#endif
+
     app_power_init();                    /* 电池自锁 + 屏幕/音频电源域 */
     app_store_init();                    /* NVS 进度 */
 
+#if BOARD_HAS_AMOLED
+    /* 彩屏断电就没画面了，NVS 里记的「屏上是哪一张」只对墨水屏成立（墨水屏断电还留着字）。
+     * 不清掉的话开机恢复上次的字时 request_display 会判定「画面没变」，屏就一直黑着。
+     * 必须排在 app_store_init() 之后 —— 它会从 NVS 把 s_shown 读回来。*/
+    app_store_set_shown(-1);
+#endif
+
+#if !BOARD_HAS_AMOLED
     i2c_master_Init();
+#endif
     user_button_init();
     audio_bsp_init();
     audio_play_init();                   /* 16kHz / 2ch / 16bit，播放+录音同时打开 */
@@ -545,19 +925,35 @@ void user_app_init(void)
     app_audio_init(SD_ROOT);
     app_audio_set_volume(s_cfg.volume);
 
+#if BOARD_HAS_EPAPER
     s_epd_buf = (uint8_t *)heap_caps_malloc(EPD_BUF_SIZE, MALLOC_CAP_SPIRAM);
     assert(s_epd_buf);
     epaper_port_init();
+#elif BOARD_HAS_AMOLED
+    /* 整屏 322 KB 只能放 PSRAM。面板是从这块缓冲直接 DMA 出去的（分条送，见 panel_push），
+     * 所以送屏期间不能改它 —— display_task 是唯一的写入者，天然满足。*/
+    s_fb = (uint16_t *)heap_caps_malloc(AMOLED_FB_BYTES, MALLOC_CAP_SPIRAM);
+    assert(s_fb);
+    /* 笔顺动画的两块: 米字格框内的原始像素 + anim/<id>.bin 原文。
+     * 分不到也不致命，load_anim 会退回静态显示。*/
+    s_glyph    = (uint16_t *)heap_caps_malloc(GRID_S * GRID_S * 2, MALLOC_CAP_SPIRAM);
+    s_anim_raw = (uint8_t  *)heap_caps_malloc(ANIM_MAX_BYTES, MALLOC_CAP_SPIRAM);
+    if (!s_glyph || !s_anim_raw) ESP_LOGW(TAG, "笔顺动画内存不够，只做静态显示");
+#endif
 
     s_total = load_total();
     if (s_total <= 0) {
         ESP_LOGE(TAG, "没有可用生字数据");
         app_audio_tone(TONE_TIMEOUT);
+#if BOARD_HAS_EPAPER
         epaper_port_clear(EPD_1IN54G_WHITE);
+#endif
         app_store_set_shown(-1);
         if (!app_power_usb_connected()) {        /* 电池供电就别空耗电 */
             vTaskDelay(pdMS_TO_TICKS(2000));
+#if BOARD_HAS_EPAPER
             epaper_port_sleep();
+#endif
             app_power_off();
         }
         return;

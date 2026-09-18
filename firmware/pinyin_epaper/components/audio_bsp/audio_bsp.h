@@ -14,6 +14,7 @@ uint8_t *i2s_get_handle(uint32_t *len);
 
 void audio_play_init(void);
 
+void audio_record_set_gain(float db);
 void audio_playback_read(void *data_ptr,uint32_t len);
 
 void audio_playback_write(void *data_ptr,uint32_t len);

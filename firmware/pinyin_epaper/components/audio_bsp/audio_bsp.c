@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include "audio_bsp.h"
+#include "user_config.h"
 #include "freertos/FreeRTOS.h"
 #include "codec_board.h"
 #include "codec_init.h"
@@ -17,7 +18,7 @@ extern const uint8_t music_pcm_end[]   asm("_binary_canon_pcm_end");
 
 void audio_bsp_init(void)
 {
-  	set_codec_board_type("S3_ePaper_1_54");
+  	set_codec_board_type(CODEC_BOARD_NAME);
 	codec_init_cfg_t codec_cfg = 
     {
         .in_mode = CODEC_I2S_MODE_STD,
@@ -87,13 +88,18 @@ void audio_playback_set_vol(uint8_t vol)
 void audio_play_init(void)
 {
 	esp_codec_dev_set_out_vol(playback, 100.0); //设置100声音大小
-  	esp_codec_dev_set_in_gain(record, 45.0);   //设置录音时的增益
+  	esp_codec_dev_set_in_gain(record, MIC_GAIN_DB);   //录音增益，各板不同，见 user_config.h
   	esp_codec_dev_sample_info_t fs = {};
   	  fs.sample_rate = 16000;
   	  fs.channel = 2;
   	  fs.bits_per_sample = 16;
   	esp_codec_dev_open(playback, &fs); //打开播放
   	esp_codec_dev_open(record, &fs);   //打开录音
+}
+
+void audio_record_set_gain(float db)
+{
+  	esp_codec_dev_set_in_gain(record, db);
 }
 
 void audio_playback_read(void *data_ptr,uint32_t len)
