@@ -54,6 +54,21 @@ stroke_order=on
 stroke_gap_ms=0
 """
 
+def fresh(src, tgt):
+    """卡上那份是不是已经是最新的 —— 同样大、而且不比源旧。
+
+    别只比大小：重排笔顺归属后，anim 文件每个字的像素总数不变，2500 个文件大小
+    一个字节都没变，光看大小会全部判成「已拷过」，改动悄悄地就漏掉了。img565
+    更是每张都是固定的 329728 字节，大小这个判据在那儿从来就没有意义。
+    shutil.copy 不带 mtime 过去，所以卡上那份的时间就是拷贝时间，比源新即为最新。
+    FAT 的时间戳精度是 2 秒，留一点余量。
+    """
+    if not tgt.exists():
+        return False
+    a, b = src.stat(), tgt.stat()
+    return a.st_size == b.st_size and b.st_mtime + 2 >= a.st_mtime
+
+
 def main():
     if len(sys.argv) < 2:
         sys.exit("用法: python pack_sd.py /Volumes/<SD卡名>")
@@ -84,7 +99,7 @@ def main():
                 missing_aud.append(a.name)
 
     # AMOLED 彩屏图。一张卡要同时喂两块板子，所以和墨水屏的 img/ 并排放，互不覆盖。
-    # 786 MB 拷一次要好几分钟，已经在卡上且大小对的就跳过，重跑不用重来。
+    # 786 MB 拷一次要好几分钟，卡上那份是新的就跳过，重跑不用重来。
     n565 = skip565 = 0
     if SRC_IMG565.exists():
         d565 = dst / "img565"
@@ -94,7 +109,7 @@ def main():
             if not (src.exists() and src.stat().st_size == IMG565_BYTES):
                 continue
             tgt = d565 / src.name
-            if tgt.exists() and tgt.stat().st_size == IMG565_BYTES:
+            if fresh(src, tgt) and tgt.stat().st_size == IMG565_BYTES:
                 skip565 += 1
                 continue
             shutil.copy(src, tgt); n565 += 1
@@ -109,7 +124,7 @@ def main():
         print(f"彩屏图 {n565 + skip565}/{len(recs)} 张（新拷 {n565}，已存在 {skip565}）"
               + (f"，清掉 {junk} 个 ._ 附属文件" if junk else ""))
 
-    # 笔顺动画（只有 AMOLED 板用）。大小不固定，用「非空且和源一样大」当已拷过的判据
+    # 笔顺动画（只有 AMOLED 板用）
     na = skipa = 0
     if SRC_ANIM.exists():
         da = dst / "anim"
@@ -119,7 +134,7 @@ def main():
             if not src.exists():
                 continue
             tgt = da / src.name
-            if tgt.exists() and tgt.stat().st_size == src.stat().st_size:
+            if fresh(src, tgt):
                 skipa += 1
                 continue
             shutil.copy(src, tgt); na += 1

@@ -26,6 +26,7 @@
 import json, struct, sys, re
 from pathlib import Path
 
+import cv2
 import numpy as np
 from PIL import Image, ImageDraw
 
@@ -50,6 +51,20 @@ MAX_STROKES = 48                  # 一个字节存画数；实际最多三十�
 MEDIAN_STEP = 4.0
 # 落在某一画轮廓内的像素，到该画中线的距离打这个折 —— 让「在自己笔画里」压过「离别人中线近」
 INSIDE_BONUS = 0.4
+CROSS_SLACK  = 1.6      # 交叉判定：中线距离在最近者的这个倍数以内才算「真的压在一起」
+CROSS_PAD    = 2.0
+# 逐画配准：makemeahanzi 和霞鹜文楷是两套字，整字外框对齐后单个笔画仍能差七八像素，
+# 所以每一画再单独平移一次去贴真墨迹。搜索半径 8 px，位移越大罚得越多。
+REG_RANGE    = 8
+REG_PENALTY  = 0.15
+# 补断：后写的画从先写的一画身上挖走、且其实更贴先写那条中线的像素，还回去
+UNCUT_FAC    = 1.3
+UNCUT_PAD    = 2.0
+UNCUT_PASSES = 3
+REPAIR_PASSES = 6       # 浮块归位迭代轮数
+# 整块认领：没有中线经过的墨块，拿各画轮廓去套，重心对齐后再上下左右找这么多像素
+ORPHAN_RANGE = 6
+ORPHAN_DECAY = 40.0     # 中线离这块墨每远这么多像素，认领分打一次 1/e 的折
 
 
 # ---------- SVG 路径 ----------
@@ -115,6 +130,227 @@ def load_graphics(wanted):
     return g
 
 
+K8 = np.ones((3, 3), np.uint8)
+
+
+def register(inkm, masks, meds):
+    """逐画平移配准：把每一画的轮廓推到最贴真墨迹的位置，中线跟着一起挪。
+
+    整字按外接框对齐之后，makemeahanzi 的单个笔画和霞鹜文楷的墨迹仍能差七八像素
+    （左右结构的两半各偏各的）。差这么多的时候「离哪条中线近」就会判错 ——
+    第 2 画的中线压到了长横的左端，那一小块就被判给第 2 画，写第 2 画时凭空冒出来。
+    """
+    R = REG_RANGE
+    pad = np.zeros((BOX_H + 2 * R, BOX_W + 2 * R), dtype=bool)
+    pad[R:R + BOX_H, R:R + BOX_W] = inkm
+    out_m, out_d = [], []
+    for mk, (mp, ms) in zip(masks, meds):
+        area = max(int(mk.sum()), 1)
+        best, cx, cy = (-1e9, 0, 0), 0, 0
+        for step in (2, 1):                                  # 先粗后细
+            rr = R if step == 2 else 2
+            for dy in range(cy - rr, cy + rr + 1, step):
+                for dx in range(cx - rr, cx + rr + 1, step):
+                    if abs(dx) > R or abs(dy) > R:
+                        continue
+                    ov = (mk & pad[R + dy:R + dy + BOX_H, R + dx:R + dx + BOX_W]).sum()
+                    sc = ov / area - REG_PENALTY * ((dx * dx + dy * dy) / (R * R))
+                    if sc > best[0]:
+                        best = (sc, dx, dy)
+            cx, cy = best[1], best[2]
+        dx, dy = best[1], best[2]
+        mm = np.zeros_like(mk)
+        mm[max(0, dy):BOX_H + min(0, dy), max(0, dx):BOX_W + min(0, dx)] = \
+            mk[max(0, -dy):BOX_H + min(0, -dy), max(0, -dx):BOX_W + min(0, -dx)]
+        out_m.append(mm)
+        out_d.append((mp + np.array([dx, dy], dtype=np.float64), ms))
+    return out_m, out_d
+
+
+def uncut(grid, dist, key, n, lockm):
+    """后写的画不许把先写的一画挖断。
+
+    一画被挖断，写它的时候中间就是一段黑的，看着像没写全；把挖走的、
+    其实更贴先写那条中线的像素还给它。还回去之后后写的那一画路过这儿时
+    像素已经是白的，看起来就是自然地压过去。
+    """
+    for _ in range(UNCUT_PASSES):
+        moved = 0
+        for k in range(n):
+            mk = (grid == k).astype(np.uint8)
+            if not mk.any():
+                continue
+            ncomp, lab = cv2.connectedComponents(mk, connectivity=8)
+            if ncomp <= 2:
+                continue
+            blob = ((grid == k) | (grid > k)).astype(np.uint8)
+            _, lb = cv2.connectedComponents(blob, connectivity=8)
+            groups = {}
+            for c in range(1, ncomp):
+                groups.setdefault(int(lb[lab == c][0]), []).append(c)
+            for tag, cs in groups.items():
+                if len(cs) < 2:                              # 没跟别的块连在一块，不是被挖断
+                    continue
+                sel = (lb == tag) & (grid > k) & ~lockm
+                if not sel.any():
+                    continue
+                sy, sx = np.nonzero(sel)
+                idx = np.searchsorted(key, sy.astype(np.int64) * BOX_W + sx)
+                cur = grid[sy, sx]
+                take = dist[idx, k] <= dist[idx, cur] * UNCUT_FAC + UNCUT_PAD
+                if take.any():
+                    grid[sy[take], sx[take]] = k
+                    moved += int(take.sum())
+        if not moved:
+            break
+
+
+def repair(grid, dist, key, med, n, lockm, lab):
+    """浮块归位：一画写出来必须是连着的 —— 要么自己连成一片，要么贴着先写过的墨。
+
+    两头都不沾的碎块就是分错了，动画里成了凭空冒出来的一小撮（就是「残留」）；
+    把它整块让给周围占得最多的那一画。
+
+    还有一条硬约束：一画写出来的墨只可能落在一座墨岛上。「领」里令字的捺在
+    makemeahanzi 里伸得长，中线一直探到右边页字头上，于是捺把页字的一小块也
+    划拉过来了 —— 隔着一整片空白，动画里就是凭空亮起一小撮。跨岛的那块一律退回去。
+    """
+    for _ in range(REPAIR_PASSES):
+        moved = 0
+        for k in range(n):
+            mk = (grid == k).astype(np.uint8)
+            if not mk.any():
+                continue
+            ncomp, lb = cv2.connectedComponents(mk, connectivity=8)
+            if ncomp <= 2:
+                continue
+            # 哪一块是主体：看笔尖（中线采样点）在哪块里走得最多。
+            # 不能只看谁大 —— 「仪」的点和捺的起笔都被判给了第 3 画，702 对 687，
+            # 按大小选主体正好选反，对的那个点反被当成碎片挪走了。
+            mp = med[k][0]
+            px = np.clip(mp[:, 0].astype(int), 0, BOX_W - 1)
+            py = np.clip(mp[:, 1].astype(int), 0, BOX_H - 1)
+            hit = np.bincount(lb[py, px], minlength=ncomp)
+            hit[0] = 0
+            comps = sorted(((int(hit[c]), int((lb == c).sum()), c) for c in range(1, ncomp)),
+                           reverse=True)
+            # claim_orphans 认领下来的整块是这一画最确凿的墨，它就是主体，
+            # 剩下那些（多半是判错抢来的）都该让出去。
+            lock = [c for c in range(1, ncomp) if lockm[lb == c].any()]
+            if lock:
+                home = int(lab[lb == lock[0]][0])             # 这一画该待的那座墨岛
+            else:
+                isl = np.bincount(lab[mk > 0], minlength=int(lab.max()) + 1)
+                isl[0] = 0
+                home = int(isl.argmax())
+            stay = [t for t in comps if int(lab[lb == t[2]][0]) == home]
+            earlier = (grid >= 0) & (grid < k)
+
+            def touches_earlier(c):
+                s = lb == c
+                return bool(earlier[(cv2.dilate(s.astype(np.uint8), K8) > 0) & ~s].any())
+
+            if lock:
+                main = max(lock, key=lambda c: int((lb == c).sum()))
+            elif not stay:
+                main = comps[0][2]
+            else:
+                # 主体优先挑「接着先写过的墨」的那一块。光看笔尖走得多会挑错 ——
+                # 「愿」里厂字那一撇，makemeahanzi 的中线大半压在白字头上，
+                # 于是把白字那一块当成了主体，真正接着上一横往下撇的那块反被让了出去。
+                main = max(stay, key=lambda t: (touches_earlier(t[2]), t[0], t[1]))[2]
+            for _h, cnt, c in comps:
+                if c == main or c in lock:                   # 主体和认领块不动
+                    continue
+                sel = lb == c
+                ring = (cv2.dilate(sel.astype(np.uint8), K8) > 0) & ~sel
+                # 同岛上的碎块贴着先写过的墨就留着（看起来是连着的）；
+                # 跨岛的、以及已经认领到别处的那一画的碎块，一律退回去。
+                if int(lab[sel][0]) == home and not lock and earlier[ring].any():
+                    continue
+                sy, sx = np.nonzero(sel)
+                dd = dist[np.searchsorted(key, sy.astype(np.int64) * BOX_W + sx)].mean(0).copy()
+                dd[k] = np.inf
+                nb = np.unique(grid[ring])
+                nb = nb[(nb >= 0) & (nb != k)]
+                # 在挨着的那几画里挑中线最近的一画。按「周围谁的像素多」投票会投错：
+                # 碎块往往正贴着另一画的粗腰，而它其实是第三画被压断的一截。
+                if len(nb):
+                    dst = int(nb[np.argmin(dd[nb])])
+                else:
+                    # 四周一个邻居都没有的孤块：两画会互相推让（「仪」那一点就是
+                    # 甲判给乙、乙判给甲，六轮下来还在弹）。判一次就锁住，别再动。
+                    dst = int(dd.argmin())
+                    lockm[sel] = True
+                grid[sel] = dst
+                moved += cnt
+        if not moved:
+            break
+
+
+def claim_orphans(inkm, masks, meds):
+    """整块认领：没有任何一画的中线经过的墨块，整块判给轮廓最贴它的那一画。
+
+    makemeahanzi 和霞鹜文楷偶尔把同一个部件摆在不一样的位置 ——「仪」里义字的
+    那一点，前者点在捺的左上方，后者点在撇和捺当中，差了三十多像素，register
+    的 8 px 够不着。这种时候按「离哪条中线近」判必错（撇的中线反而更近），而且
+    这一块会在 repair 里被两画来回推、永远收敛不了。改成拿各画的轮廓去套这块墨，
+    谁套得最严实就是谁的 —— 一个点大小的墨块，只有「点」那一画套得上。
+    判一次就锁死，后面 uncut/repair 都不许再动它。
+    """
+    ncomp, lab = cv2.connectedComponents(inkm.astype(np.uint8), connectivity=8)
+    if ncomp <= 2:
+        return lab, {}
+    near = lab.astype(np.float32)                            # 中线可能擦出墨边，就近吸附几格
+    for _ in range(4):
+        g = cv2.dilate(near, K8)
+        near = np.where(near == 0, g, near)
+    near = near.astype(np.int32)
+    taken = np.zeros(ncomp, dtype=bool)
+    for mp, _ms in meds:
+        px = np.clip(mp[:, 0].astype(int), 0, BOX_W - 1)
+        py = np.clip(mp[:, 1].astype(int), 0, BOX_H - 1)
+        h = np.bincount(near[py, px], minlength=ncomp)
+        h[0] = 0
+        if h.sum():
+            taken[int(h.argmax())] = True
+    out = {}
+    for c in range(1, ncomp):
+        if taken[c]:
+            continue
+        blob = lab == c
+        area = int(blob.sum())
+        by, bx = np.nonzero(blob)
+        cy, cx = by.mean(), bx.mean()
+        far = cv2.distanceTransform((~blob).astype(np.uint8), cv2.DIST_L2, 3)
+        best = (-1.0, 0)
+        for k, mk in enumerate(masks):
+            my, mx = np.nonzero(mk)
+            if len(my) == 0:
+                continue
+            oy = int(round(cy - my.mean()))                  # 先把轮廓重心搬到墨块重心上
+            ox = int(round(cx - mx.mean()))
+            inter = 0
+            for dy in range(oy - ORPHAN_RANGE, oy + ORPHAN_RANGE + 1, 2):
+                for dx in range(ox - ORPHAN_RANGE, ox + ORPHAN_RANGE + 1, 2):
+                    yy, xx = my + dy, mx + dx
+                    ok = (yy >= 0) & (yy < BOX_H) & (xx >= 0) & (xx < BOX_W)
+                    inter = max(inter, int(blob[yy[ok], xx[ok]].sum()))
+            mp = meds[k][0]
+            px = np.clip(mp[:, 0].astype(int), 0, BOX_W - 1)
+            py = np.clip(mp[:, 1].astype(int), 0, BOX_H - 1)
+            d = float(far[py, px].min())
+            # 三件事都要：这一画的轮廓基本被这块墨吞掉（说明它只有这么大）、
+            # 两者形状也对得上、而且它的中线本来就在附近。少一件就会判错 ——
+            # 光看贴合度，「领」里令字那一点会被捺抢走（捺也小）；光看中线远近，
+            # 「仪」里那一点会被撇抢走（撇的中线正好压过去）。
+            sc = (inter / len(my)) * (2 * inter / (len(my) + area)) * np.exp(-d / ORPHAN_DECAY)
+            if sc > best[0]:
+                best = (sc, k)
+        out[c] = best[1]
+    return lab, out
+
+
 def build(rec, glyph):
     """返回 (每画的像素表, 提示串)。像素表是 list[np.ndarray(n,2) uint8]，框内坐标 (x,y)。"""
     a = np.fromfile(IMG565 / f"{rec['id']:04d}.bin", dtype=">u2").reshape(SCR_H, SCR_W)
@@ -142,28 +378,58 @@ def build(rec, glyph):
         p = np.asarray(p, dtype=np.float64)
         return np.stack([(p[:, 0] - ex0) * sx + gx0, (p[:, 1] - ey0) * sy + gy0], 1)
 
-    ink = np.stack([ix, iy], 1).astype(np.float32)          # (N,2)
-    best = np.full(len(ink), np.inf, dtype=np.float32)
-    owner = np.zeros(len(ink), dtype=np.int16)
-    tpos = np.zeros(len(ink), dtype=np.float32)
+    ink  = np.stack([ix, iy], 1).astype(np.float32)          # (N,2)
+    inkm = np.zeros((BOX_H, BOX_W), dtype=bool)
+    inkm[iy, ix] = True
 
+    masks, meds = [], []
     for k in range(n):
-        # 这一画的轮廓 → 掩膜
         m = Image.new("1", (BOX_W, BOX_H), 0)
         dr = ImageDraw.Draw(m)
         for sub in strokes[k]:
             dr.polygon([tuple(q) for q in to_box(sub)], fill=1)
-        inside = np.asarray(m)[ink[:, 1].astype(int), ink[:, 0].astype(int)]
+        masks.append(np.asarray(m).copy())
+        meds.append(densify(to_box(medians[k]), MEDIAN_STEP))
+    masks, meds = register(inkm, masks, meds)
+    lab, forced = claim_orphans(inkm, masks, meds)
 
-        mp, ms = densify(to_box(medians[k]), MEDIAN_STEP)
-        d = np.sqrt(((ink[:, None, :] - mp[None, :, :].astype(np.float32)) ** 2).sum(-1))
-        j = d.argmin(1)
-        dist = d[np.arange(len(ink)), j].astype(np.float32)
-        score = np.where(inside, dist * INSIDE_BONUS, dist)
+    N = len(ink)
+    dist   = np.empty((N, n), dtype=np.float32)              # 到各画中线的最近距离
+    inside = np.zeros((N, n), dtype=bool)                    # 是否落在各画的轮廓里
+    med    = []                                              # 各画的中线采样点和弧长位置
+    for k in range(n):
+        inside[:, k] = masks[k][iy, ix]
+        mp, ms = meds[k]
+        mp = mp.astype(np.float32)
+        med.append((mp, ms))
+        dist[:, k] = np.sqrt(((ink[:, None, :] - mp[None, :, :]) ** 2).sum(-1)).min(1)
 
-        hit = score < best
-        best[hit] = score[hit]; owner[hit] = k; tpos[hit] = ms[j][hit]
+    owner = np.where(inside, dist * INSIDE_BONUS, dist).argmin(1).astype(np.int16)
 
+    # 交叉处归先写的那一画。后写的压在先写的上面，不该把先写的那一笔挖断 ——
+    # 挖断了它写出来中间是一段黑的，很脏；归先写的之后，后写的那一画路过这儿时
+    # 像素已经是白的，看起来就是自然地压过去。
+    # 只认「两条中线都从这儿附近过」的真交叉：轮廓偶尔会胖到盖住别的笔画，那种不算，
+    # 否则会把像素提前一大截放出来。
+    multi = inside.sum(1) >= 2
+    if multi.any():
+        dm = np.where(inside[multi], dist[multi], np.inf)
+        near = dm <= (dm.min(1, keepdims=True) * CROSS_SLACK + CROSS_PAD)
+        owner[multi] = near.argmax(1)                        # 第一个 True = 最早的那一画
+
+    grid = np.full((BOX_H, BOX_W), -1, dtype=np.int16)
+    grid[iy, ix] = owner
+    lockm = np.zeros((BOX_H, BOX_W), dtype=bool)
+    for c, k in forced.items():
+        sel = lab == c
+        grid[sel] = k
+        lockm[sel] = True
+    key = iy.astype(np.int64) * BOX_W + ix                   # 行优先，已排好序，可二分
+    uncut(grid, dist, key, n, lockm)
+    repair(grid, dist, key, med, n, lockm, lab)
+    owner = grid[iy, ix]
+
+    # 画内先后：按最近中线采样点的弧长位置排。归属动过的像素也在这儿一并重算。
     out, orphan = [], 0
     for k in range(n):
         sel = np.nonzero(owner == k)[0]
@@ -171,7 +437,9 @@ def build(rec, glyph):
             orphan += 1
             out.append(np.zeros((0, 2), dtype=np.uint8))
             continue
-        sel = sel[np.argsort(tpos[sel], kind="stable")]
+        mp, ms = med[k]
+        d = np.sqrt(((ink[sel][:, None, :] - mp[None, :, :]) ** 2).sum(-1))
+        sel = sel[np.argsort(ms[d.argmin(1)], kind="stable")]
         out.append(np.stack([ix[sel], iy[sel]], 1).astype(np.uint8))
     return out, (f"{orphan} 画没分到像素" if orphan else "")
 

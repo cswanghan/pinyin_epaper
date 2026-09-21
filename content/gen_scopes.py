@@ -43,6 +43,7 @@
 输出 out/scope/NN_*.txt，制表符分隔: <字id>\t<汉字>\t<说法>
 家长可照此格式手写课本单元的清单丢进 SD 卡（固件把所有清单合起来当查字表）。
 """
+from __future__ import annotations    # 这台机器是 Python 3.9，int | None 只能当字符串注解
 import argparse, csv, json, sys, unicodedata
 from pathlib import Path
 
