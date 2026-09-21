@@ -28,6 +28,7 @@ void amoled_port_draw_rows(const uint16_t *fb, int y0, int rows) { (void)fb; (vo
 void amoled_port_fill(uint16_t c)  { (void)c; }
 void amoled_port_test_pattern(void) { }
 void amoled_port_sleep(void)       { }
+void amoled_port_wake(void)        { }
 
 #else
 
@@ -276,6 +277,14 @@ void amoled_port_sleep(void)
     if (!s_panel) return;
     esp_lcd_panel_disp_on_off(s_panel, false);
     esp_lcd_panel_disp_sleep(s_panel, true);
+}
+
+void amoled_port_wake(void)
+{
+    if (!s_panel) return;
+    esp_lcd_panel_disp_sleep(s_panel, false);
+    vTaskDelay(pdMS_TO_TICKS(120));            /* sleep out 之后面板要这么久才稳 */
+    esp_lcd_panel_disp_on_off(s_panel, true);
 }
 
 #endif /* BOARD_HAS_AMOLED */

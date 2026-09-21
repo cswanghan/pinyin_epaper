@@ -25,6 +25,7 @@ typedef enum {
     SR_CMD_MASTERED,      /* 我会了 */
     SR_CMD_REVIEW,        /* 复习 */
     SR_CMD_FORGOT,        /* 忘了 */
+    SR_CMD_BYE,           /* 再见 —— 熄屏待机，不断电 */
     SR_CMD_FIXED_COUNT,
 } sr_fixed_cmd_t;
 

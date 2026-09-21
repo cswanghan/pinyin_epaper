@@ -28,8 +28,10 @@ typedef enum {
     TOUCH_SWIPE_RIGHT,
 } touch_evt_t;
 
-/* 回调在触摸任务里跑，别在里面干耗时的事，post 一条命令就回来。*/
-typedef void (*touch_cb_t)(touch_evt_t evt);
+/* 回调在触摸任务里跑，别在里面干耗时的事，post 一条命令就回来。
+ * (x,y) 是手指按下那一刻的位置，屏幕坐标（0..367 / 0..447）——
+ * 轻点要落到屏上哪个按钮就看它。滑动不关心位置，给的也是起点。*/
+typedef void (*touch_cb_t)(touch_evt_t evt, int x, int y);
 
 /* 探测芯片、配好 INT、起触摸任务。没插触摸或读不到芯片 ID 就返回 false。*/
 bool touch_bsp_init(touch_cb_t cb);

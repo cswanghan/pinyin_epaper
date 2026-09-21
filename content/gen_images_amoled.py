@@ -55,6 +55,11 @@ WORD_LINES            = 2
 # 这里不画，只是保证版式不会占用它。
 MASTER_BOX = (316, 14, 356, 54)
 
+# 左上角留给电量图标，同样是固件画的（user_app.cpp draw_battery565）。
+# 现在靠 PINYIN_MAX_W=280 居中自然让出了 x<44 这一条；写在这儿是为了将来有人
+# 调宽拼音或往左上角加东西时，知道这块地方被占着。
+BATTERY_BOX = (4, 20, 39, 36)
+
 
 def tone_of(syl):
     for ch in unicodedata.normalize("NFD", syl):

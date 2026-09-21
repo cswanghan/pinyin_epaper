@@ -18,6 +18,7 @@ idf_component_register(
   epaper_port
   amoled_port
   touch_bsp
+  axp_bsp
   led_bsp
   sdcard_bsp
   INCLUDE_DIRS ".")

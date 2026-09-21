@@ -51,6 +51,9 @@
 #if BOARD_HAS_TOUCH
 #include "touch_bsp.h"
 #endif
+#if BOARD_HAS_AXP2101
+#include "axp_bsp.h"
+#endif
 
 #define TAG "PINYIN"
 
@@ -86,6 +89,7 @@ static bool     s_sr_ready   = false;
 static bool     s_dirty      = false;   /* 进度有变化，还没导出 */
 static int64_t  s_dirty_at   = 0;
 static int64_t  s_active_at  = 0;       /* 最近一次操作，用于自动关机 */
+static bool     s_standby    = false;   /* 说了「再见」后熄屏待机，不断电 */
 static scope_t *s_lookup     = NULL;    /* 查字表 = 所有清单合起来，开机读一次 */
 
 static QueueHandle_t  s_cmd_q     = NULL;
@@ -102,16 +106,50 @@ static void post_cmd(int cmd)
 }
 
 #if BOARD_HAS_TOUCH
-/* 触摸补的是按键的缺口：这块板没有 GPIO 上的 PWR 键。
- * 轻点 = 单击 BOOT（唤醒语音），左右滑 = 翻字，和语音的「下一个/上一个」同一条命令。*/
-static void on_touch(touch_evt_t evt)
+/* 轻点按落点分区。
+ *
+ * 屏上不画按钮：1.8 寸屏横着才 32 mm，画四个按钮每个只有 5 mm 见方，
+ * 孩子的手指按不准（成年人也按不准）。索性把整屏切成三大块，最小的一块
+ * 也有 290×90 px ≈ 25×8 mm，闭着眼按都能中。代价是屏上没有文字提示，
+ * 但这几块的位置本身就说明了它是什么 —— 点字就是再读一遍，点词组就是读词组。
+ *
+ *   y <  90   左边 = 唤醒说话      右边(x>=290) = 我会了（右上角画勾那块）
+ *   y 90..343 = 米字格            → 这个字重来一遍（笔顺动画 + 朗读）
+ *   y >= 344  = 词组区            → 读词组
+ *
+ * 分界线跟着版面走，和 content/gen_images_amoled.py 的 MASTER_BOX / SEP_Y、
+ * 以及下面的 GRID_Y 是同一套坐标，改版面就要回来改这里。
+ * 坐标不做任何变换 —— CST816 吐出来的就是 0..367 / 0..447（2026-09-20 实机
+ * 四角实测 (1,1) (367,1) (38,406) (355,441)）。*/
+#define TAP_TOP_Y      90      /* 拼音行和米字格的分界，取在两者中间的空白上 */
+#define TAP_MASTER_X  290      /* 「我会了」的左边界。方框实际在 x316，往左放宽 26 px 好按 */
+#define TAP_WORDS_Y   344      /* 分隔线 SEP_Y */
+
+static void on_touch(touch_evt_t evt, int x, int y)
 {
-    switch (evt) {
-    case TOUCH_SWIPE_LEFT:  post_cmd(SR_CMD_NEXT); break;
-    case TOUCH_SWIPE_RIGHT: post_cmd(SR_CMD_PREV); break;
-    case TOUCH_TAP:
-    default:                post_cmd(APP_EVT_WAKE_KEY); break;
+    if (evt == TOUCH_SWIPE_LEFT)  { post_cmd(SR_CMD_NEXT); return; }
+    if (evt == TOUCH_SWIPE_RIGHT) { post_cmd(SR_CMD_PREV); return; }
+
+    if (y < TAP_TOP_Y) {
+        if (x >= TAP_MASTER_X) { ESP_LOGI(TAG, "点右上角 → 我会了");   post_cmd(SR_CMD_MASTERED); }
+        else                   { ESP_LOGI(TAG, "点拼音 → 等孩子说话"); post_cmd(APP_EVT_WAKE_KEY); }
+    } else if (y < TAP_WORDS_Y) {
+        ESP_LOGI(TAG, "点米字格 → 这个字再来一遍");
+        post_cmd(APP_EVT_RESHOW);
+    } else {
+        ESP_LOGI(TAG, "点词组 → 读词组");
+        post_cmd(SR_CMD_WORDS);
     }
+}
+#endif
+
+#if BOARD_HAS_AXP2101
+/* PWR 键挂在 AXP2101 上，回调在它的轮询任务里跑 —— 只投递，别在这儿干活。
+ * 短按当「开关灯」用：这是电源键最自然的语义，也给「再见」配了个按键版本，
+ * 孩子懒得说话的时候按一下就黑屏。真关机要按住不放。*/
+static void on_pwr_key(axp_key_t key)
+{
+    post_cmd(key == AXP_KEY_LONG ? APP_EVT_POWER_OFF : APP_EVT_PWR_KEY);
 }
 #endif
 
@@ -227,6 +265,102 @@ static void draw_check565(uint16_t *fb)
     uint16_t g = amoled_rgb(90, 220, 110);
     thick_line565(fb, CHECK_X + 4,  CHECK_Y + 22, CHECK_X + 15, CHECK_Y + 33, 2, g);
     thick_line565(fb, CHECK_X + 15, CHECK_Y + 33, CHECK_X + 36, CHECK_Y + 6,  2, g);
+}
+
+/* ---------------- 左上角电量图标 ----------------
+ * 和右上角那个勾一样是固件画的，不进图片生成流程 —— 电量每分钟都在变，
+ * 不可能预渲染。位置选在左上角是因为 gen_images_amoled.py 的 PINYIN_MAX_W=280
+ * 居中排版，拼音最左只到 x44，左边这一条永远是黑的，压不到任何东西。*/
+#define BAT_X   4
+#define BAT_Y  20
+#define BAT_W  32       /* 电池身子。右边还有 3 px 正极头，总宽 35，离 x44 还剩 6 px */
+#define BAT_H  16
+
+/* 锂电池放电曲线，取几个拐点线性插值。
+ * 不直接用 AXP 的电量计（0xA4）—— 2026-09-20 实测它在 4165 mV 报 57%，
+ * 断电重启后 4107 mV 反而报 100%，前后矛盾。那种电量计要完整充放几轮才学得准，
+ * 现在信不过。电压折算精度差一些，但至少单调，不会越充越少。
+ *
+ * 【满电点是 4.10 V，不是教科书的 4.20 V】第一版把 100% 锚在 4200 mV，结果
+ * 充了一晚上图标还差一格。2026-09-20 插着 USB 连读三次、间隔两分钟：
+ * 4102 / 4101 / 4101 mV，电压是平的不是在爬，说明充电早就停了 —— 这块电池
+ * 充满静置就在 4.10 V（0xA4 这时候也一直报 100，和电压对得上）。
+ * 所以整条曲线按实测的满电点重锚，底下仍留 3400 mV = 0%：宁可提前报空，
+ * 也别让它在孩子手里毫无预兆地断电。*/
+static int bat_pct(int mv)
+{
+    static const struct { int mv, pct; } CURVE[] = {
+        {4100, 100}, {4000, 88}, {3900, 72}, {3800, 56},
+        {3700, 40},  {3600, 24}, {3500, 10}, {3400,  0},
+    };
+    const int n = sizeof(CURVE) / sizeof(CURVE[0]);
+    if (mv >= CURVE[0].mv)     return 100;
+    if (mv <= CURVE[n - 1].mv) return 0;
+    for (int i = 1; i < n; i++) {
+        if (mv >= CURVE[i].mv) {
+            int dm = CURVE[i - 1].mv  - CURVE[i].mv;
+            int dp = CURVE[i - 1].pct - CURVE[i].pct;
+            return CURVE[i].pct + (mv - CURVE[i].mv) * dp / dm;
+        }
+    }
+    return 0;
+}
+
+static void fill_rect565(uint16_t *fb, int x, int y, int w, int h, uint16_t c)
+{
+    for (int j = 0; j < h; j++)
+        for (int i = 0; i < w; i++) px565(fb, x + i, y + j, c);
+}
+
+static int s_bat_drawn = -999;   /* 上次画上去的档位，-999 = 还没画过 */
+
+/* 画到 fb 上。返回 true 表示画出来的东西和上次不一样 ——
+ * 整屏刷新时调用方不看返回值，照画；只想补个图标的那条路靠它决定要不要推屏。*/
+static bool draw_battery565(uint16_t *fb)
+{
+    int mv = app_power_vbat_mv();
+    if (mv < 0) return false;            /* 读不到就一笔都不画，空壳图标比没有更误导 */
+
+    bool chg = app_power_usb_connected();
+    int  pct = bat_pct(mv) / 5 * 5;      /* 归到 5% 一档，电压抖一下不至于重画 */
+    int  key = pct + (chg ? 1000 : 0);
+    bool changed = (key != s_bat_drawn);
+    s_bat_drawn = key;
+
+    uint16_t frame = amoled_rgb(165, 165, 165);         /* 和词组同一个灰，不抢眼 */
+    /* 四声四色那套配色里挑三个，屏上已有的颜色不另立新的 */
+    uint16_t c = pct > 40 ? amoled_rgb( 90, 210, 110)
+               : pct > 15 ? amoled_rgb(255, 180,  40)
+                          : amoled_rgb(255,  90,  90);
+
+    fill_rect565(fb, BAT_X, BAT_Y, BAT_W + 3, BAT_H, 0);            /* 先擦干净上一次的 */
+    fill_rect565(fb, BAT_X, BAT_Y, BAT_W, 1, frame);                /* 上下左右四条边 */
+    fill_rect565(fb, BAT_X, BAT_Y + BAT_H - 1, BAT_W, 1, frame);
+    fill_rect565(fb, BAT_X, BAT_Y, 1, BAT_H, frame);
+    fill_rect565(fb, BAT_X + BAT_W - 1, BAT_Y, 1, BAT_H, frame);
+    fill_rect565(fb, BAT_X + BAT_W, BAT_Y + 5, 3, 6, frame);        /* 右边小正极头 */
+
+    int fw = (BAT_W - 4) * pct / 100;
+    if (fw > 0) fill_rect565(fb, BAT_X + 2, BAT_Y + 2, fw, BAT_H - 4, c);
+
+    if (chg) {                                          /* 充电时盖一道白闪电 */
+        uint16_t w = amoled_rgb(255, 255, 255);
+        int cx = BAT_X + BAT_W / 2, cy = BAT_Y + BAT_H / 2;
+        thick_line565(fb, cx + 3, cy - 5, cx - 3, cy + 1, 1, w);
+        thick_line565(fb, cx - 3, cy + 1, cx + 1, cy + 1, 1, w);
+        thick_line565(fb, cx + 1, cy + 1, cx - 2, cy + 5, 1, w);
+    }
+    return changed;
+}
+
+/* 电量变了就只把图标那几行推上去（368×20 像素，几毫秒），不惊动整屏。
+ * 刷屏或写笔顺的时候躲开 —— 那两条路正在往同一块 fb 上写。*/
+static void refresh_battery(void)
+{
+    if (!s_fb || s_standby || s_disp_busy) return;
+    if (app_store_get_shown() < 0) return;      /* 屏上还没有正经画面，没什么可补的 */
+    if (!draw_battery565(s_fb)) return;
+    amoled_port_draw_rows(s_fb, BAT_Y, BAT_H);
 }
 
 static bool load_image(int id)
@@ -444,6 +578,7 @@ static void display_task(void *arg)
             ESP_LOGI(TAG, "id=%d 画面没变，跳过", id);
         } else if (load_image(id)) {
             if (code & 1) draw_check565(s_fb);
+            draw_battery565(s_fb);                /* 图从 SD 读进来是干净的，每次都要补画 */
             app_store_set_shown(-1);              /* 刷到一半断电 → 下次开机必刷 */
 
             /* 要写笔顺就先把字收起来，屏上只留拼音、词组和空米字格 */
@@ -470,6 +605,11 @@ static void display_task(void *arg)
         if (uxQueueMessagesWaiting(s_disp_q) == 0) s_disp_busy = false;
     }
 }
+
+/* 待机醒来专用：显存里还是熄屏前那一屏，直接推回面板就行。
+ * 不走 request_display —— 那条路会把 shown 清掉、从头再写一遍笔顺，
+ * 而孩子按亮屏幕只是想看看刚才那个字。*/
+static void redraw_last(void) { if (s_fb) amoled_port_draw(s_fb); }
 
 #else  /* 两块屏都没有 —— P0 阶段的无屏版本 */
 
@@ -685,8 +825,46 @@ static void power_off(const char *why)
     if (s_dirty) export_progress();
 #if BOARD_HAS_EPAPER
     epaper_port_sleep();
+#elif BOARD_HAS_AMOLED
+    amoled_port_sleep();          /* 先熄屏再断电，免得面板停在写了一半的帧上 */
 #endif
     app_power_off();
+}
+
+/* 「再见」= 熄屏待机。不断电：语音一直在听，喊唤醒词、按 BOOT、点屏幕都能回来。
+ *
+ * 和关机（长按 PWR，走 AXP2101 断电）是两回事，故意留着两条路：待机随口一句就能
+ * 回来，关机要重新长按开机。AMOLED 黑屏就是不发光，待机本身已经很省电了。*/
+static void standby_enter(const char *why)
+{
+#if BOARD_HAS_AMOLED
+    if (s_standby) return;
+    ESP_LOGI(TAG, "熄屏待机（%s）—— 喊「你好小智」或点屏幕唤醒", why);
+    app_audio_stop();
+    app_audio_prompt("bye", TONE_BYE);
+    for (int i = 0; i < 50 && !app_audio_idle(); i++) vTaskDelay(pdMS_TO_TICKS(100));
+    /* 正在写笔顺就等它写完再黑屏，免得停在写了一半的字上 */
+    for (int i = 0; i < 400 && s_disp_busy; i++) vTaskDelay(pdMS_TO_TICKS(100));
+    if (s_dirty) export_progress();
+    s_standby = true;
+    amoled_port_sleep();
+#else
+    /* 墨水屏板有自锁电源，「再见」就是真关机；断电后画面还留在屏上，不用熄屏这一说 */
+    power_off(why);
+#endif
+}
+
+static void standby_exit(void)
+{
+#if BOARD_HAS_AMOLED
+    if (!s_standby) return;
+    s_standby = false;
+    ESP_LOGI(TAG, "醒来，点亮屏幕");
+    amoled_port_wake();
+    amoled_port_brightness(AMOLED_BRIGHTNESS);   /* 退休眠后亮度寄存器不保证还在 */
+    if (app_store_get_shown() >= 0) redraw_last();
+    else { int id = cur_id(); if (id >= 0) request_display(id); }
+#endif
 }
 
 /* 刷屏期间命令照常执行，不再挡着: 换字排进显示队列（深度 1，后者覆盖前者），
@@ -765,6 +943,19 @@ static void handle_learn_cmd(int cmd)
 
 static void handle_cmd(int cmd)
 {
+    /* 待机时随便来一条命令都先把屏点亮，然后照常执行 —— 点屏幕换字、
+     * 喊唤醒词说话，都不该还要求先「开机」一下。
+     * 只有再见本身和几条控制台命令不点屏：已经睡着了就别再睡一次。*/
+    if (s_standby) {
+        switch (cmd) {
+        case SR_CMD_BYE:      ESP_LOGI(TAG, "已经在待机了"); return;
+        case APP_EVT_PWR_KEY: standby_exit(); return;   /* 短按 PWR 就是开关灯，亮完就完了 */
+        case EVT_SR_READY: case APP_EVT_STATUS:
+        case APP_EVT_LIST:  case APP_EVT_EXPORT: break; /* 不点屏，照常处理 */
+        default:              standby_exit(); break;    /* 其余命令先点亮再执行 */
+        }
+    }
+
     switch (cmd) {
     case EVT_SR_READY:
         s_sr_ready = true;
@@ -776,7 +967,23 @@ static void handle_cmd(int cmd)
     case APP_EVT_STATUS:    log_status(); return;
     case APP_EVT_LIST:      log_scope(); return;
     case APP_EVT_EXPORT:    export_progress(); return;
+#if BOARD_HAS_AXP2101
+    case APP_EVT_AXP_DUMP:  axp_bsp_dump("控制台"); return;
+#endif
     case APP_EVT_POWER_OFF: power_off("长按 PWR"); return;
+    case SR_CMD_BYE:        standby_enter("说了再见"); return;   /* 不刷新 s_active_at：
+                                                                  * 待机后空闲计时接着走 */
+    case APP_EVT_PWR_KEY:   standby_enter("按了 PWR 键"); return;
+    case APP_EVT_RESHOW: {
+        /* 同一个字，request_display 本来会判「画面没变」直接跳过。先把 shown 清掉逼它重画 ——
+         * 刷屏本来就要写两次 shown（先 -1 再写新值），这一句只是把第一次提前，不多一次闪存写。*/
+        int id = cur_id();
+        if (id < 0) return;
+        app_audio_stop();
+        app_store_set_shown(-1);
+        request_display(id);
+        break;
+    }
     case APP_EVT_WAKE_KEY:
         /* 不用喊「你好小智」，按一下就能说话。按这个键就表示「我要说话了」，
          * 所以先把正在念的笔顺掐掉 —— 不然孩子得等十几秒才轮到自己开口，
@@ -801,6 +1008,9 @@ static void command_task(void *arg)
         int cmd;
         if (xQueueReceive(s_cmd_q, &cmd, pdMS_TO_TICKS(1000)) == pdTRUE) handle_cmd(cmd);
 
+#if BOARD_HAS_AMOLED
+        refresh_battery();           /* 一秒看一次，档位真变了才推屏 */
+#endif
         int64_t now = esp_timer_get_time();
         bool idle = !s_disp_busy && app_audio_idle();
         if (s_dirty && idle && now - s_dirty_at > EXPORT_DELAY_US) export_progress();
@@ -808,7 +1018,11 @@ static void command_task(void *arg)
         if (s_cfg.sleep_minutes > 0 && idle &&
             now - s_active_at > (int64_t)s_cfg.sleep_minutes * 60 * 1000 * 1000) {
             if (app_power_usb_connected()) s_active_at = now;   /* 连着电脑调试时不自动关机 */
+#if BOARD_HAS_AMOLED
+            else if (!s_standby) standby_enter("长时间无操作");  /* 这块板还关不了机，先熄屏 */
+#else
             else power_off("长时间无操作");
+#endif
         }
     }
 }
@@ -886,6 +1100,18 @@ void user_app_init(void)
      * I2C 在 15/14，和屏的 QSPI（4/5/6/7/11/12）不冲突。*/
     i2c_master_Init();
     i2c_bus_scan();
+
+#if BOARD_HAS_AXP2101
+    /* PWR 键和电池都在 AXP2101 上（寄存器怎么探出来的见 axp_bsp.h 顶部）。
+     * 排在这儿是因为它只依赖 I2C，屏还没起来也能跑。*/
+    if (axp_bsp_init()) {
+#if AXP_PROBE
+        axp_bsp_probe_start();
+#else
+        axp_bsp_key_start(on_pwr_key);
+#endif
+    }
+#endif
 
     if (amoled_port_init()) {
         amoled_port_brightness(AMOLED_BRIGHTNESS);
@@ -977,7 +1203,18 @@ void user_app_init(void)
     xTaskCreatePinnedToCore(command_task, "cmd_task",    6 * 1024, NULL, 4, NULL, 1);
     xTaskCreatePinnedToCore(button_task,  "button_task", 3 * 1024, NULL, 4, NULL, 1);
     app_console_start(post_cmd);
-    ESP_LOGI(TAG, "按键: BOOT 单击=下一个 双击=重播 长按=词组 | PWR 单击=我会了 双击=复习 长按=关机");
+    /* 这行以前和 button_task 对不上（写的是 BOOT 单击=下一个），照着代码改回来 */
+    ESP_LOGI(TAG, "按键: BOOT 单击=唤醒 双击=下一个 长按=读词组");
+#if BOARD_HAS_PWR_BUTTON
+    ESP_LOGI(TAG, "      PWR  单击=我会了 双击=复习 长按=关机");
+#elif BOARD_HAS_AXP2101
+    ESP_LOGI(TAG, "      PWR  短按=熄屏/亮屏 按住一秒=关机");
+#endif
+#if BOARD_HAS_TOUCH
+    ESP_LOGI(TAG, "触摸: 左滑=下一个 右滑=上一个");
+    ESP_LOGI(TAG, "      点米字格=再来一遍 点词组=读词组 点右上角=我会了 点拼音=说话");
+#endif
+    ESP_LOGI(TAG, "说「再见」熄屏待机，喊唤醒词或点屏幕回来");
 
     /* 语音模型加载要几秒，和第一次刷屏并行；就绪后交给 cmd_task 注册命令词 */
     sr_config_t sr = {};

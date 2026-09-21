@@ -128,6 +128,7 @@ static const struct fixed_cmd FIXED[] = {
     { SR_CMD_MASTERED, "wo hui le,hui le,ren shi" },
     { SR_CMD_REVIEW,   "fu xi" },
     { SR_CMD_FORGOT,   "wang le,wo wang le,mei ji zhu" },
+    { SR_CMD_BYE,      "zai jian,bai bai,bu xue le,xiu xi yi hui" },
 };
 
 /* 从 "a,b,c" 里取下一条说法，返回起点（不以 \0 结尾），*len 为长度，没有了返回 NULL。
@@ -268,11 +269,14 @@ static int register_fixed(void)
  * 孩子说话、方言口音常常前后鼻音不分、平翘舌不分、n/l 不分，MultiNet 也会听混。
  * 这些差别只算一小半（COST_ALT），听到「de zang」也去「de zhang」那份里找。
  * 一次只换一处（「zhang」→ zang / chang / zhan，不会到 can）。
+ * 注意 alt_has 只认第一条 [0] 等于 a 的行，同一个韵母不能拆成两行写 ——
+ * 「uan」的三个去处必须挤在同一行里，另起一行的那条永远走不到。
  */
 static const char *const FINAL_ALT[][3] = {
     { "an", "ang" },   { "ang", "an" },   { "en", "eng" },   { "eng", "en" },
     { "in", "ing" },   { "ing", "in" },   { "ian", "iang" }, { "iang", "ian" },
-    { "uan", "uang" }, { "uang", "uan" }, { "uo", "o", "ou" }, { "o", "uo" }, { "ou", "uo" },
+    { "uan", "uang", "un" }, { "uang", "uan" }, { "un", "uan" },
+    { "uo", "o", "ou" }, { "o", "uo" }, { "ou", "uo" },
 };
 static const char *const INIT_ALT[][3] = {
     { "zh", "z", "ch" }, { "ch", "c", "zh" }, { "sh", "s", "ch" },

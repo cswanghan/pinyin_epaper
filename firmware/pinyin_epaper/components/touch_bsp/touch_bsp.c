@@ -33,7 +33,12 @@ static bool chip_id_ok(uint8_t id) { return id >= 0xB4 && id <= 0xB7; }
 #define SWIPE_MIN_PX     60
 #define TAP_MAX_PX       25
 #define TAP_MAX_MS      800
-#define POLL_MS          25      /* 按住期间的采样间隔，只在手指在屏上时才跑 */
+#define POLL_MS          25      /* 按住期间的采样间隔 */
+/* 空闲时的兜底轮询间隔。CST816 的 INT 只在「按下」那一瞬给一个下降沿，
+ * 芯片自己还会进待机 —— 配置一丢就再也不给中断，整块屏从此像死了一样。
+ * 实测就栽在这儿（连点五个角，一条事件都没有）。所以中断只当「快路」，
+ * 真正保证能摸到的是这条 100 ms 的轮询：一秒十次读 6 个字节，可以忽略不计。*/
+#define POLL_IDLE_MS    100
 
 static touch_cb_t         s_cb   = NULL;
 static SemaphoreHandle_t  s_sem  = NULL;
@@ -49,7 +54,13 @@ static void IRAM_ATTR int_isr(void *arg)
 static bool read_point(int *x, int *y)
 {
     uint8_t r[6] = {0};
-    if (i2c_peek(CST816_ADDR, REG_GESTURE, r, sizeof(r)) != 0) return false;
+    if (i2c_peek(CST816_ADDR, REG_GESTURE, r, sizeof(r)) != 0) {
+        /* 芯片彻底不应答（掉电、被复位、睡死）和「没手指」是两回事，
+         * 分不出来就只能猜。隔一阵报一声，日志里一眼就能看出是哪种。*/
+        static int fail = 0;
+        if (++fail % 200 == 1) ESP_LOGW(TAG, "CST816 不应答（累计 %d 次）", fail);
+        return false;
+    }
     if (r[1] == 0) return false;                      /* FingerNum */
     *x = ((r[2] & 0x0F) << 8) | r[3];
     *y = ((r[4] & 0x0F) << 8) | r[5];
@@ -59,11 +70,11 @@ static bool read_point(int *x, int *y)
 static void touch_task(void *arg)
 {
     for (;;) {
-        /* 手指不在屏上时就停在这儿，一点 I2C 流量都不跑 */
-        if (xSemaphoreTake(s_sem, portMAX_DELAY) != pdTRUE) continue;
+        /* 有中断就立刻走，没有就每 100 ms 自己看一眼（见 POLL_IDLE_MS） */
+        xSemaphoreTake(s_sem, pdMS_TO_TICKS(POLL_IDLE_MS));
 
         int x0 = 0, y0 = 0;
-        if (!read_point(&x0, &y0)) continue;          /* 抖动，INT 来了但没按住 */
+        if (!read_point(&x0, &y0)) continue;          /* 没手指，或者 INT 来了但没按住 */
 
         int64_t t0 = esp_timer_get_time();
         int x = x0, y = y0, nx, ny;
@@ -89,10 +100,10 @@ static void touch_task(void *arg)
             ESP_LOGD(TAG, "忽略: dx=%d dy=%d %dms", dx, dy, ms);
             continue;                                  /* 不上不下的动作，不猜 */
         }
-        ESP_LOGI(TAG, "%s (dx=%d dy=%d %dms)",
+        ESP_LOGI(TAG, "%s @(%d,%d) (dx=%d dy=%d %dms)",
                  evt == TOUCH_TAP ? "轻点" : evt == TOUCH_SWIPE_LEFT ? "左滑" : "右滑",
-                 dx, dy, ms);
-        if (s_cb) s_cb(evt);
+                 x0, y0, dx, dy, ms);
+        if (s_cb) s_cb(evt, x0, y0);
     }
 }
 

@@ -14,7 +14,7 @@ content/graphics.txt
 vendor/
 
 # ESP-IDF 构建产物
-firmware/*/build/
+firmware/*/build*/
 firmware/*/sdkconfig
 firmware/*/sdkconfig.old
 firmware/*/managed_components/

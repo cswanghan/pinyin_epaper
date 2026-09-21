@@ -45,6 +45,7 @@
 #define BOARD_HAS_PWR_BUTTON  1   /* PWR 键接在 GPIO 上，multi_button 能读 */
 #define BOARD_HAS_BAT_ADC     1   /* 电池电压走 ADC */
 #define BOARD_HAS_TOUCH       0   /* 没有触摸屏 */
+#define BOARD_HAS_AXP2101     0   /* 没有 PMU，电源全是普通 GPIO */
 
 #elif APP_BOARD == BOARD_AMOLED_1_8
 
@@ -73,6 +74,7 @@
 #define BOARD_HAS_PWR_BUTTON  0   /* PWR 键在 AXP2101 上 */
 #define BOARD_HAS_BAT_ADC     0   /* 电量也从 AXP2101 读；GPIO4 在这块板上是屏的 DATA0 */
 #define BOARD_HAS_TOUCH       1   /* CST816S 电容触摸(0x15)，这块板没有 PWR 键，靠它补上 */
+#define BOARD_HAS_AXP2101     1   /* AXP2101(0x34)：电池、各路电源、PWR 键都归它 */
 
 /*屏 CO5300 QSPI
  *  CS=12 PCLK=11 D0=4 D1=5 D2=6 D3=7，走 SPI2_HOST，40 MHz x 4 线

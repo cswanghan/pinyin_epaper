@@ -24,6 +24,9 @@ extern "C" {
 #define APP_EVT_EXPORT      (-12)
 #define APP_EVT_LIST        (-13)
 #define APP_EVT_WAKE_KEY    (-14)   /* 单击 BOOT: 手动唤醒，进监听窗口等孩子说话 */
+#define APP_EVT_RESHOW      (-15)   /* 点米字格: 这个字重来一遍（笔顺动画 + 朗读）*/
+#define APP_EVT_PWR_KEY     (-16)   /* 短按 PWR: 亮着就熄屏，熄着就点亮 */
+#define APP_EVT_AXP_DUMP    (-17)   /* 控制台 axp: 打一遍 PMU 寄存器（只读）*/
 
 /* 切组只有控制台能做（数值避开 SR_CMD_CHAR_BASE + 字 id 的范围）*/
 #define APP_CMD_GROUP_NEXT  90

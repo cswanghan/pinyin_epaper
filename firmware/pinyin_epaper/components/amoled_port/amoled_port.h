@@ -52,6 +52,11 @@ void amoled_port_test_pattern(void);
 /* 熄屏进休眠。*/
 void amoled_port_sleep(void);
 
+/* 从休眠回来。面板退出 sleep 后内部要重新起振，手册要求等 120 ms 才能再收命令，
+ * 所以这个函数是阻塞的 —— 别在触摸回调那种地方直接调。
+ * 醒来后显存内容不保证还在，调用方必须重刷一整屏。*/
+void amoled_port_wake(void);
+
 /* RGB888 → RGB565，大端。给设备端自己画东西用（测试图、提示条）。*/
 static inline uint16_t amoled_rgb(uint8_t r, uint8_t g, uint8_t b)
 {

@@ -22,6 +22,9 @@
 
 #include "app_power.h"
 #include "user_config.h"
+#if BOARD_HAS_AXP2101
+#include "axp_bsp.h"
+#endif
 
 #if BOARD_HAS_GPIO_POWER
 #include "board_power_bsp.h"
@@ -80,7 +83,12 @@ int app_power_vbat_mv(void)
     return ok ? (sum / ok) * 2 : -1;
 }
 
-#else  /* 电量要从 AXP2101 读，P1 再做 */
+#elif BOARD_HAS_AXP2101   /* AMOLED 板：电池挂在 PMU 上，读寄存器就行，不走 ADC */
+
+static void adc_init(void) {}
+int app_power_vbat_mv(void) { return axp_bsp_vbat_mv(); }
+
+#else
 
 static void adc_init(void) {}
 int app_power_vbat_mv(void) { return -1; }
@@ -101,8 +109,13 @@ void app_power_init(void)
         ESP_LOGI(TAG, "从深度睡眠唤醒（原因 %d）", (int)cause);
 
     adc_init();
+#if BOARD_HAS_AXP2101
+    ESP_LOGI(TAG, "电池 %d mV / %d%%  USB %s", app_power_vbat_mv(), axp_bsp_percent(),
+             app_power_usb_connected() ? "已连接电脑" : "未连接电脑");
+#else
     ESP_LOGI(TAG, "电池电压 %d mV  USB %s", app_power_vbat_mv(),
              app_power_usb_connected() ? "已连接电脑" : "未连接电脑");
+#endif
 }
 
 bool app_power_usb_connected(void) { return usb_serial_jtag_is_connected(); }
@@ -134,9 +147,11 @@ void app_power_off(void)
     esp_sleep_enable_ext1_wakeup(1ULL << PWR_BUTTON_PIN, ESP_EXT1_WAKEUP_ANY_LOW);
     vTaskDelay(pdMS_TO_TICKS(50));                                     /* 让日志发完 */
     esp_deep_sleep_start();
+#elif BOARD_HAS_AXP2101
+    /* AMOLED 板没有 GPIO 自锁，电源全在 AXP2101 手里：写一下软关机位，
+     * 芯片自己切断所有输出。开机通路还没验通，见 axp_bsp.h 里那段。*/
+    axp_bsp_shutdown();
 #else
-    /* AMOLED 板：关机得写 AXP2101 的关断寄存器，唤醒也得靠它的 PKEY 中断。
-     * P0 阶段还没接 PMU，这里不睡 —— 真睡下去没有唤醒源，只能按复位键。*/
-    ESP_LOGW(TAG, "这块板的关机要走 AXP2101（P1 再做），本次忽略");
+    ESP_LOGW(TAG, "这块板没有关机通路，本次忽略");
 #endif
 }

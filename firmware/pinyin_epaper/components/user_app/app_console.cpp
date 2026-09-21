@@ -31,6 +31,10 @@ static const struct { const char *name; int cmd; } k_cmds[] = {
     {"wake", SR_EVT_WAKE},    {"timeout", SR_EVT_TIMEOUT},
     {"s", APP_EVT_STATUS},    {"l", APP_EVT_LIST},
     {"export", APP_EVT_EXPORT}, {"off", APP_EVT_POWER_OFF},
+    {"bye", SR_CMD_BYE},      /* 熄屏待机，敲任意命令（比如 k）唤回来 */
+    {"pwr", APP_EVT_PWR_KEY}, /* 等同短按 PWR 键：亮着就熄屏，熄着就点亮 */
+    {"re",  APP_EVT_RESHOW},  /* 等同点米字格：这个字重来一遍 */
+    {"axp", APP_EVT_AXP_DUMP},/* 打一遍 PMU 寄存器，只读 —— 查电源相关的毛病用 */
 };
 
 static void run_line(char *s)
@@ -66,7 +70,7 @@ static void run_line(char *s)
         while (*q == ' ') q++;
         if (*q) { app_groups_grep(q); return; }
     }
-    ESP_LOGI(TAG, "命令: n p r w m f v | c 汉字或字id 查字 | py 拼音 按听到的拼音查字 | gn gp g N 切组 | l 本组字表 | find 汉字或拼音 | wake timeout s export off");
+    ESP_LOGI(TAG, "命令: n p r w m f v | c 汉字或字id 查字 | py 拼音 按听到的拼音查字 | gn gp g N 切组 | l 本组字表 | find 汉字或拼音 | wake timeout s export off bye pwr re axp");
 }
 
 static void console_task(void *arg)
